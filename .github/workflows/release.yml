@@ -22,10 +22,6 @@ jobs:
       uses: actions/setup-go@v5
       with:
         go-version: '1.24.3'
-    
-    # Initialize Go module (critical fix)
-    - name: Initialize Go module
-      run: go mod init github.com/${{ github.repository }}
 
     - name: Get version
       id: version

@@ -21,7 +21,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
-        go-version: '1.23.4'  # Use stable Go version
+        go-version: '1.23.4'
 
     - name: Get version
       id: version
@@ -34,107 +34,171 @@ jobs:
           echo "version=dev-$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
         fi
 
-    # Add code signing preparation (optional)
-    - name: Prepare build environment
-      run: |
-        echo "Building release version ${{ steps.version.outputs.version }}"
-        # Add any build-time metadata or signing preparation here
-
-    - name: Build binaries with enhanced metadata
+    - name: Build reproducible binaries
       run: |
         mkdir -p dist
+        
+        # Reproducible build settings
+        export CGO_ENABLED=0
+        export GOFLAGS="-trimpath -mod=readonly"
+        export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+        
+        # Build metadata for transparency
+        GIT_COMMIT=$(git rev-parse HEAD)
+        BUILD_DATE=$(date -u -d @${SOURCE_DATE_EPOCH} +%Y-%m-%dT%H:%M:%SZ)
+        GO_VERSION=$(go version | cut -d' ' -f3)
+        
+        # Enhanced ldflags for reproducible builds
+        LDFLAGS="-s -w -buildid= -X main.version=${{ steps.version.outputs.version }} -X main.gitCommit=${GIT_COMMIT} -X main.buildDate=${BUILD_DATE} -X main.goVersion=${GO_VERSION}"
+        
         targets=(
           "linux/amd64"
-          "linux/arm64"
+          "linux/arm64" 
           "windows/amd64"
           "windows/arm64"
           "darwin/amd64"
           "darwin/arm64"
         )
         
-        # Enhanced build flags to reduce false positives
-        BUILD_FLAGS="-ldflags=-s -w -X main.version=${{ steps.version.outputs.version }} -X main.buildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        
         for target in "${targets[@]}"; do
           GOOS=${target%/*}
           GOARCH=${target#*/}
-          output_name="go-knigavuhe-${{ steps.version.outputs.version }}-${GOOS}-${GOARCH}"
           
+          output_name="go-knigavuhe-${{ steps.version.outputs.version }}-${GOOS}-${GOARCH}"
           if [ "$GOOS" = "windows" ]; then
             output_name+=".exe"
           fi
           
           echo "Building ${output_name}..."
-          GOOS=$GOOS GOARCH=$GOARCH go build $BUILD_FLAGS -o "dist/$output_name" ./cmd/go-knigavuhe
-          
-          # Create archives
-          if [ "$GOOS" = "windows" ]; then
-            (cd dist && zip "${output_name%.exe}.zip" "$output_name")
-            rm "dist/$output_name"
-          else
-            (cd dist && tar -czf "$output_name.tar.gz" "$output_name")
-            rm "dist/$output_name"
-          fi
+          GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="$LDFLAGS" -o "dist/$output_name" ./cmd/go-knigavuhe
         done
 
-    - name: Create source archive
-      run: |
-        git archive --format=tar.gz --prefix=go-knigavuhe-${{ steps.version.outputs.version }}/ HEAD > dist/go-knigavuhe-${{ steps.version.outputs.version }}-src.tar.gz
-        git archive --format=zip --prefix=go-knigavuhe-${{ steps.version.outputs.version }}/ HEAD > dist/go-knigavuhe-${{ steps.version.outputs.version }}-src.zip
-
-    - name: Generate checksums and metadata
+    - name: Generate build attestation
       run: |
         cd dist
-        sha256sum * > checksums.txt
         
-        # Create a metadata file for transparency
-        cat > release-info.txt << EOF
-        Release: go-knigavuhe ${{ steps.version.outputs.version }}
-        Build Date: $(date -u)
-        Go Version: $(go version)
-        Git Commit: $(git rev-parse HEAD)
+        # Create detailed build information
+        cat > build-info.json << EOF
+        {
+          "version": "${{ steps.version.outputs.version }}",
+          "git_commit": "$(git rev-parse HEAD)",
+          "git_tag": "$(git describe --tags --exact-match 2>/dev/null || echo 'none')",
+          "build_date": "$(date -u -d @${SOURCE_DATE_EPOCH:-$(date +%s)} +%Y-%m-%dT%H:%M:%SZ)",
+          "go_version": "$(go version)",
+          "runner_os": "${{ runner.os }}",
+          "runner_arch": "${{ runner.arch }}",
+          "github_sha": "${{ github.sha }}",
+          "github_ref": "${{ github.ref }}",
+          "workflow_run_id": "${{ github.run_id }}",
+          "workflow_url": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+          "source_url": "https://github.com/${{ github.repository }}/tree/${{ github.sha }}",
+          "build_flags": "-trimpath -mod=readonly",
+          "cgo_enabled": false
+        }
+        EOF
         
-        This is a legitimate audiobook downloader for knigavuhe.org
-        Source code: https://github.com/${{ github.repository }}
+        # Generate checksums
+        sha256sum *.exe > checksums-windows.txt 2>/dev/null || true
+        sha256sum go-knigavuhe-*-linux-* go-knigavuhe-*-darwin-* > checksums-unix.txt 2>/dev/null || true
+        sha256sum * > checksums-all.txt
         
-        If your antivirus flags this as malware, it's a false positive.
-        The software downloads audiobooks from a legal Russian audiobook site.
+        # Create verification instructions
+        cat > VERIFY.md << 'EOF'
+        # Verification Instructions
+        
+        ## Source Code Verification
+        1. **Commit Hash**: Check that the git commit in `build-info.json` matches the tagged release
+        2. **Workflow**: View the build process at the workflow URL in `build-info.json`
+        3. **Reproducible Build**: Clone the repo at the exact commit and build with identical flags
+        
+        ## File Integrity Verification
+        ```bash
+        # Verify checksums (Linux/macOS)
+        sha256sum -c checksums-all.txt
+        
+        # Windows PowerShell
+        Get-FileHash *.exe -Algorithm SHA256 | Format-Table
+        # Compare with checksums-windows.txt
+        ```
+        
+        ## Reproducible Build Instructions
+        ```bash
+        git clone https://github.com/${{ github.repository }}.git
+        cd go-knigavuhe
+        git checkout ${{ github.sha }}
+        
+        export CGO_ENABLED=0
+        export GOFLAGS="-trimpath -mod=readonly"
+        export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+        
+        # Build for your platform
+        go build -ldflags="-s -w -buildid=" -o go-knigavuhe ./cmd/go-knigavuhe
+        
+        # Compare hash with released binary
+        sha256sum go-knigavuhe
+        ```
+        
+        ## Anti-virus False Positives
+        This software downloads files and creates directories, which may trigger heuristic detection.
+        - **It's a false positive** - the source code is fully auditable
+        - Submit false positive reports to your AV vendor
+        - Build from source using instructions above for maximum trust
         EOF
 
     - name: Create Release
       uses: softprops/action-gh-release@v2
       if: startsWith(github.ref, 'refs/tags/')
       with:
-        files: dist/*
+        files: |
+          dist/*.exe
+          dist/go-knigavuhe-*-linux-*
+          dist/go-knigavuhe-*-darwin-*
+          dist/checksums-*.txt
+          dist/build-info.json
+          dist/VERIFY.md
         generate_release_notes: true
         draft: false
         prerelease: false
         body: |
-          ## Download Instructions
+          ## 🔒 Security & Verification
           
-          **Important**: Some antivirus software may flag these binaries as false positives due to network download behavior. This is a legitimate audiobook downloader.
+          **No archives** - All binaries are uploaded directly to reduce AV false positives.
           
-          ### For Windows Users:
-          - Download the appropriate `.zip` file for your architecture
-          - Extract and run from command line
-          - If Windows Defender blocks it, you may need to add an exception
+          ### ✅ Verify Authenticity
+          - Check `build-info.json` for build details and workflow link
+          - Verify checksums with `checksums-*.txt` files  
+          - View full build log in GitHub Actions
+          - Reproduce the build locally (see `VERIFY.md`)
           
-          ### For Linux/macOS Users:
-          - Download the appropriate `.tar.gz` file
-          - Extract: `tar -xzf go-knigavuhe-*.tar.gz`
-          - Run: `./go-knigavuhe-* <output-dir> <url-file>`
+          ### 🛡️ Anti-virus Warning
+          Some AV software may flag these as suspicious due to network downloading behavior. 
+          **This is a false positive.** The source code is fully open and auditable.
           
-          ## Verification
-          - Check `checksums.txt` for file integrity
-          - Source code is available for review
-          - Build reproducibly using the provided GitHub Actions workflow
+          ### 📥 Download Instructions
+          
+          **Windows**: Download `go-knigavuhe-*-windows-amd64.exe`
+          **Linux**: Download `go-knigavuhe-*-linux-amd64` 
+          **macOS**: Download `go-knigavuhe-*-darwin-amd64`
+          
+          ### 🔍 Usage
+          ```bash
+          ./go-knigavuhe <output-directory> <urls-file>
+          ```
+          
+          Built from commit: `${{ github.sha }}`
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Upload artifacts (for manual runs)
+    - name: Upload artifacts (for manual runs)  
       if: github.event_name == 'workflow_dispatch'
       uses: actions/upload-artifact@v4
       with:
         name: release-${{ steps.version.outputs.version }}
-        path: dist/
+        path: |
+          dist/*.exe
+          dist/go-knigavuhe-*-linux-*
+          dist/go-knigavuhe-*-darwin-*
+          dist/checksums-*.txt
+          dist/build-info.json
+          dist/VERIFY.md
         retention-days: 30

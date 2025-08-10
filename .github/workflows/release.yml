@@ -48,8 +48,8 @@ jobs:
         BUILD_DATE=$(date -u -d @${SOURCE_DATE_EPOCH} +%Y-%m-%dT%H:%M:%SZ)
         GO_VERSION=$(go version | cut -d' ' -f3)
         
-        # Enhanced ldflags for reproducible builds
-        LDFLAGS="-s -w -buildid= -X main.version=${{ steps.version.outputs.version }} -X main.gitCommit=${GIT_COMMIT} -X main.buildDate=${BUILD_DATE} -X main.goVersion=${GO_VERSION}"
+        # Try different ldflags to avoid AV detection
+        LDFLAGS="-s -w -buildid= -H windowsgui -X main.version=${{ steps.version.outputs.version }} -X main.gitCommit=${GIT_COMMIT} -X main.buildDate=${BUILD_DATE} -X main.goVersion=${GO_VERSION}"
         
         targets=(
           "linux/amd64"

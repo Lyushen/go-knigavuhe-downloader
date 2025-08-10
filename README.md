@@ -2,6 +2,13 @@
 
 A fast, concurrent audiobook downloader for knigavuhe.org written in Go. Downloads entire audiobooks including cover art, descriptions, and all audio tracks with retry logic and parallel processing.
 
+**RU:** 
+- Без графического интерфейса, зато есть скорость, параллельность и минимализм
+- Не нужно устанавливать дополнительные программы, исполняемый файл для Windows/Linux содержит всё необходимое
+- Собирается из актуального кода с помощью GitHub Actions при каждом релизе, что обеспечивает безопасность
+- Использует всю доступную пропускную способность интернет-канала во время скачивания
+- Позволяет скачивать десятки книг одновременно
+
 ## Features
 
 - **Concurrent Downloads**: Multi-threaded downloading with worker pools
@@ -10,6 +17,7 @@ A fast, concurrent audiobook downloader for knigavuhe.org written in Go. Downloa
 - **Fallback Support**: Uses alternative sources when primary downloads fail
 - **Batch Processing**: Process multiple books from a URL file
 - **Cross-Platform**: Pre-built binaries for Linux and Windows
+- **Resume Downloading**: Scanned all downloaded files and resume from interrupted state
 
 ## Quick Start
 

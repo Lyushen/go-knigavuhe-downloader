@@ -39,6 +39,7 @@ jobs:
         mkdir -p dist
         
         # Reproducible build settings
+        # CGO_ENABLED=0 is critical for Android to avoid libc dependency issues
         export CGO_ENABLED=0
         export GOFLAGS="-trimpath -mod=readonly"
         export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
@@ -58,6 +59,7 @@ jobs:
           "windows/arm64"
           "darwin/amd64"
           "darwin/arm64"
+          "android/arm64" # Added Android support
         )
         
         for target in "${targets[@]}"; do
@@ -99,7 +101,8 @@ jobs:
         
         # Generate checksums
         sha256sum *.exe > checksums-windows.txt 2>/dev/null || true
-        sha256sum go-knigavuhe-*-linux-* go-knigavuhe-*-darwin-* > checksums-unix.txt 2>/dev/null || true
+        # Added android pattern to unix checksums
+        sha256sum go-knigavuhe-*-linux-* go-knigavuhe-*-darwin-* go-knigavuhe-*-android-* > checksums-unix.txt 2>/dev/null || true
         sha256sum * > checksums-all.txt
         
         # Create verification instructions
@@ -113,7 +116,7 @@ jobs:
         
         ## File Integrity Verification
         ```bash
-        # Verify checksums (Linux/macOS)
+        # Verify checksums (Linux/macOS/Android)
         sha256sum -c checksums-all.txt
         
         # Windows PowerShell
@@ -131,18 +134,12 @@ jobs:
         export GOFLAGS="-trimpath -mod=readonly"
         export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
         
-        # Build for your platform
-        go build -ldflags="-s -w -buildid=" -o go-knigavuhe ./cmd/go-knigavuhe
+        # Build for your platform (example for Android)
+        GOOS=android GOARCH=arm64 go build -ldflags="-s -w -buildid=" -o go-knigavuhe ./cmd/go-knigavuhe
         
         # Compare hash with released binary
         sha256sum go-knigavuhe
         ```
-        
-        ## Anti-virus False Positives
-        This software downloads files and creates directories, which may trigger heuristic detection.
-        - **It's a false positive** - the source code is fully auditable
-        - Submit false positive reports to your AV vendor
-        - Build from source using instructions above for maximum trust
         EOF
 
     - name: Create Release
@@ -153,6 +150,7 @@ jobs:
           dist/*.exe
           dist/go-knigavuhe-*-linux-*
           dist/go-knigavuhe-*-darwin-*
+          dist/go-knigavuhe-*-android-*
           dist/checksums-*.txt
           dist/build-info.json
           dist/VERIFY.md
@@ -179,6 +177,7 @@ jobs:
           **Windows**: Download `go-knigavuhe-*-windows-amd64.exe`
           **Linux**: Download `go-knigavuhe-*-linux-amd64` 
           **macOS**: Download `go-knigavuhe-*-darwin-amd64`
+          **Android**: Download `go-knigavuhe-*-android-arm64`
           
           ### 🔍 Usage
           ```bash
@@ -198,6 +197,7 @@ jobs:
           dist/*.exe
           dist/go-knigavuhe-*-linux-*
           dist/go-knigavuhe-*-darwin-*
+          dist/go-knigavuhe-*-android-*
           dist/checksums-*.txt
           dist/build-info.json
           dist/VERIFY.md

@@ -14,208 +14,398 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
-// MediaItem represents content item
-type MediaItem struct {
-	Title    string      `json:"title"`
-	Creators interface{} `json:"creators"`
-	Voice    interface{} `json:"voice"`
-	Image    string      `json:"image"`
-	Link     string      `json:"link"`
-}
-
-// AudioTrack represents an audio file
-type AudioTrack struct {
+// Person represents author/reader
+type Person struct {
 	Name string `json:"name"`
-	SRC  string `json:"src"`
 }
 
-// MediaContent contains all item information
-type MediaContent struct {
-	Item            MediaItem    `json:"item"`
-	Tracks          []AudioTrack `json:"tracks"`
-	CombinedTracks  []AudioTrack `json:"combined_tracks"`
-	ImageBackup     string       `json:"-"`
-	Info            string       `json:"-"`
+// Book represents book metadata
+type Book struct {
+	Name    string      `json:"name"`
+	Authors interface{} `json:"authors"` // Flexible type: map or slice
+	Readers interface{} `json:"readers"` // Flexible type: map or slice
+	Cover   string      `json:"cover"`
+	URL     string      `json:"url"`
+}
+
+// Audio represents an audio track
+type Audio struct {
+	Title string `json:"title"`
+	URL   string `json:"url"`
+}
+
+// BookData contains all book information
+type BookData struct {
+	Book           Book    `json:"book"`
+	Playlist       []Audio `json:"playlist"`
+	MergedPlaylist []Audio `json:"merged_playlist"`
+	CoverAlt       string  `json:"-"`
+	Description    string  `json:"-"`
+}
+
+// BookInfo holds series book information
+type BookInfo struct {
+	URL         string
+	DisplayName string // Includes series index (e.g., "1. Book Title")
+	SeriesIndex string // Now string to handle "6.1"
 }
 
 const (
-	maxAttempts    = 20
-	retryWait      = 2 * time.Second
-	maxConnections = 10
+	userAgent    = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36 Edg/135.0.0.0"
+	cookie       = "new_design=1"
+	maxRetries   = 20
+	retryDelay   = 2 * time.Second
+	maxIdleConns = 10
 )
 
 var (
-	jsPattern     = regexp.MustCompile(`BookController\.enter\((.*?)\);`)
-	infoPattern   = regexp.MustCompile(`bookDescription\">(.+?)</div>`)
-	invalidPath   = regexp.MustCompile(`[<>:"/\\|?*]`)
-	netTransport  = &http.Transport{
-		MaxIdleConns:    maxConnections,
-		IdleConnTimeout: 60 * time.Second,
-	}
-	netClient = &http.Client{
-		Timeout:   30 * time.Second,
-		Transport: netTransport,
+	jsonRegex      = regexp.MustCompile(`BookController\.enter\((.*?)\);`)
+	descRegex      = regexp.MustCompile(`bookDescription\">(.+?)</div>`)
+	forbiddenChars = regexp.MustCompile(`[<>:"/\\|?*]`)
+	// Updated regex to handle indices like "6.1"
+	bookItemRegex  = regexp.MustCompile(`(?s)<div class="bookitem">(.*?)</div>\s*</div>`)
+	bookURLRegex   = regexp.MustCompile(`(?s)class="bookitem_cover"\s+href="/(book/[^"]+)"`)
+	bookIndexRegex = regexp.MustCompile(`(?s)<span class="bookitem_serie_index">\s*([\d\.]+)\.\s*</span>`)
+	bookTitleRegex = regexp.MustCompile(`(?s)<span class="bookitem_serie_index">\s*[\d\.]+\.\s*</span>\s*([^<]+)`)
+	httpClient     = &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:    maxIdleConns,
+			IdleConnTimeout: 60 * time.Second,
+		},
 	}
 )
 
 func main() {
 	if len(os.Args) < 3 {
-		fmt.Println("Usage: media-collector <target-dir> <source-file>")
-		fmt.Println("  <target-dir>   : Directory for media storage")
-		fmt.Println("  <source-file>  : File containing content URLs")
+		fmt.Println("Usage:")
+		fmt.Println("  For series: audiobook-downloader <output-dir> <series-url>")
+		fmt.Println("  For file:   audiobook-downloader <output-dir> <url-file.txt>")
+		fmt.Println("  <output-dir>   : Directory to save audiobooks")
 		os.Exit(1)
 	}
 
-	storageDir := os.Args[1]
-	if err := os.MkdirAll(storageDir, 0755); err != nil {
-		log.Fatalf("Directory creation error: %v", err)
+	outputDir := os.Args[1]
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		log.Fatalf("Error creating output directory: %v", err)
 	}
 
-	links, err := readLinks(os.Args[2])
-	if err != nil {
-		log.Fatalf("URL read error: %v", err)
+	inputArg := os.Args[2]
+	var results []DownloadResult
+
+	// Check if input is a file
+	if strings.HasSuffix(strings.ToLower(inputArg), ".txt") || fileExists(inputArg) {
+		fmt.Printf("📄 Reading URLs from file: %s\n", inputArg)
+		lines, err := readLinesFromFile(inputArg)
+		if err != nil {
+			log.Fatalf("Error reading file: %v", err)
+		}
+
+		var allBooks []BookInfo
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+
+			// Check if line is a series URL
+			if strings.Contains(line, "/serie/") {
+				fmt.Printf("🔍 Extracting books from series: %s\n", line)
+				books, err := extractBooksFromSeries(line)
+				if err != nil {
+					fmt.Printf("⚠️ Error extracting series %s: %v\n", line, err)
+					continue
+				}
+				allBooks = append(allBooks, books...)
+				fmt.Printf("✅ Found %d books\n", len(books))
+			} else {
+				// Treat as individual book URL
+				allBooks = append(allBooks, BookInfo{
+					URL:         line,
+					DisplayName: extractBookNameFromURL(line),
+					SeriesIndex: fmt.Sprintf("%d", len(allBooks)+1),
+				})
+			}
+		}
+
+		if len(allBooks) == 0 {
+			log.Fatal("❌ No valid URLs or series found in file")
+		}
+
+		fmt.Printf("🚀 Processing %d total books\n", len(allBooks))
+		results = processDownloads(outputDir, allBooks)
+	} else {
+		// Treat as series URL
+		fmt.Printf("🔍 Extracting books from series: %s\n", inputArg)
+		books, err := extractBooksFromSeries(inputArg)
+		if err != nil {
+			log.Fatalf("Error extracting books from series: %v", err)
+		}
+
+		if len(books) == 0 {
+			log.Fatal("❌ No books found in series. Run with DEBUG=1 for more info.")
+		}
+
+		fmt.Printf("✅ Found %d books\n", len(books))
+		results = processDownloads(outputDir, books)
 	}
 
-	results := handleContent(storageDir, links)
-
-	fmt.Println("\nProcessing Summary:")
+	// Print summary
+	fmt.Println("\n" + strings.Repeat("=", 60))
+	fmt.Println("📊 DOWNLOAD SUMMARY")
+	fmt.Println(strings.Repeat("=", 60))
 	for _, res := range results {
-		if len(res.Issues) == 0 {
-			fmt.Printf("✅ %s\n   Location: %s\n", res.Title, res.Location)
+		if len(res.Errors) == 0 {
+			fmt.Printf("✅ %s\n   📁 %s\n", res.BookName, res.Path)
 		} else {
-			fmt.Printf("❌ %s\n   Issues:\n", res.Title)
-			for _, e := range res.Issues {
-				fmt.Printf("    - %s\n", e)
+			fmt.Printf("❌ %s\n   🚨 Errors:\n", res.BookName)
+			for _, e := range res.Errors {
+				fmt.Printf("      • %s\n", e)
 			}
 		}
 	}
+	fmt.Println(strings.Repeat("=", 60))
 }
 
-func readLinks(filename string) ([]string, error) {
+func fileExists(filename string) bool {
+	_, err := os.Stat(filename)
+	return err == nil
+}
+
+func readLinesFromFile(filename string) ([]string, error) {
 	file, err := os.Open(filename)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
 
-	var urls []string
+	var lines []string
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		if u := strings.TrimSpace(scanner.Text()); u != "" {
-			urls = append(urls, u)
+		if line := strings.TrimSpace(scanner.Text()); line != "" {
+			lines = append(lines, line)
 		}
 	}
-	return urls, scanner.Err()
+	return lines, scanner.Err()
 }
 
-func handleContent(storageDir string, urls []string) []ContentResult {
-	var wg sync.WaitGroup
-	queue := make(chan string, len(urls))
-	results := make(chan ContentResult, len(urls))
-	out := make([]ContentResult, 0, len(urls))
+func extractBookNameFromURL(bookURL string) string {
+	parts := strings.Split(bookURL, "/")
+	if len(parts) > 0 {
+		lastPart := parts[len(parts)-1]
+		lastPart = strings.TrimSuffix(lastPart, "/") // <- fix for S1017
 
-	workers := runtime.NumCPU()
+		// Remove "book/123-" prefix if present
+		if idx := strings.Index(lastPart, "-"); idx > 0 {
+			lastPart = lastPart[idx+1:]
+		}
+		return strings.ReplaceAll(lastPart, "-", " ")
+	}
+	return "Unknown Book"
+}
+
+func extractBooksFromSeries(seriesURL string) ([]BookInfo, error) {
+	html, err := downloadPage(seriesURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to download series page: %w", err)
+	}
+
+	if os.Getenv("DEBUG") == "1" {
+		debugFile := "debug_series.html"
+		os.WriteFile(debugFile, []byte(html), 0644)
+		fmt.Printf("Debug: Saved HTML to %s\n", debugFile)
+	}
+
+	var books []BookInfo
+	matches := bookItemRegex.FindAllStringSubmatch(html, -1)
+
+	if os.Getenv("DEBUG") == "1" {
+		fmt.Printf("Debug: Found %d raw book items\n", len(matches))
+	}
+
+	for i, match := range matches {
+		content := match[1]
+
+		urlMatch := bookURLRegex.FindStringSubmatch(content)
+		if len(urlMatch) < 2 {
+			if os.Getenv("DEBUG") == "1" {
+				fmt.Printf("Debug: Item %d - No URL match\n", i+1)
+			}
+			continue
+		}
+
+		indexMatch := bookIndexRegex.FindStringSubmatch(content)
+		if len(indexMatch) < 2 {
+			if os.Getenv("DEBUG") == "1" {
+				fmt.Printf("Debug: Item %d - No index match\n", i+1)
+			}
+			continue
+		}
+		index := strings.TrimSpace(indexMatch[1])
+
+		titleMatch := bookTitleRegex.FindStringSubmatch(content)
+		if len(titleMatch) < 2 {
+			if os.Getenv("DEBUG") == "1" {
+				fmt.Printf("Debug: Item %d - No title match\n", i+1)
+			}
+			continue
+		}
+		title := strings.TrimSpace(titleMatch[1])
+
+		displayName := fmt.Sprintf("%s. %s", index, title)
+		books = append(books, BookInfo{
+			URL:         "https://knigavuhe.org/" + urlMatch[1],
+			DisplayName: displayName,
+			SeriesIndex: index,
+		})
+	}
+
+	// Sort by series index using version number comparison
+	sort.Slice(books, func(i, j int) bool {
+		return compareIndices(books[i].SeriesIndex, books[j].SeriesIndex)
+	})
+
+	return books, nil
+}
+
+// compareIndices compares version-like indices (e.g., "1", "2", "6.1", "6.10")
+func compareIndices(a, b string) bool {
+	partsA := strings.Split(a, ".")
+	partsB := strings.Split(b, ".")
+
+	for i := 0; i < len(partsA) && i < len(partsB); i++ {
+		numA, _ := strconv.Atoi(partsA[i])
+		numB, _ := strconv.Atoi(partsB[i])
+
+		if numA != numB {
+			return numA < numB
+		}
+	}
+
+	return len(partsA) < len(partsB)
+}
+
+func processDownloads(outputDir string, books []BookInfo) []DownloadResult {
+	var wg sync.WaitGroup
+	bookChan := make(chan BookInfo, len(books))
+	resultChan := make(chan DownloadResult, len(books))
+
+	workers := runtime.NumCPU() * 2
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for u := range queue {
-				results <- fetchContent(u, storageDir)
+			for book := range bookChan {
+				result := downloadBook(book.URL, outputDir, book.DisplayName)
+				resultChan <- result
 			}
 		}()
 	}
 
-	for _, u := range urls {
-		queue <- u
+	for i, book := range books {
+		fmt.Printf("📝 Queuing %d/%d: %s\n", i+1, len(books), book.DisplayName)
+		bookChan <- book
 	}
-	close(queue)
+	close(bookChan)
 
 	go func() {
 		wg.Wait()
-		close(results)
+		close(resultChan)
 	}()
 
-	for res := range results {
-		out = append(out, res)
+	results := make([]DownloadResult, 0, len(books))
+	for res := range resultChan {
+		results = append(results, res)
 	}
-	return out
+
+	// Sort results by series index
+	sort.Slice(results, func(i, j int) bool {
+		idxI := extractIndex(results[i].BookName)
+		idxJ := extractIndex(results[j].BookName)
+		return compareIndices(idxI, idxJ)
+	})
+
+	return results
 }
 
-func fetchContent(contentURL, storageDir string) ContentResult {
-	result := ContentResult{Source: contentURL}
+func extractIndex(bookName string) string {
+	parts := strings.SplitN(bookName, ".", 2)
+	if len(parts) > 0 {
+		return parts[0]
+	}
+	return "999"
+}
 
-	normalized, err := cleanURL(contentURL)
+func downloadBook(bookURL, outputDir, displayName string) DownloadResult {
+	result := DownloadResult{URL: bookURL}
+
+	normalizedURL, err := normalizeURL(bookURL)
 	if err != nil {
-		result.addIssue("URL normalization", err)
+		result.addError("URL normalization", err)
 		return result
 	}
 
-	media, err := getMediaData(normalized)
+	bookData, err := fetchBookData(normalizedURL)
 	if err != nil {
-		result.addIssue("data retrieval", err)
+		result.addError("fetch book data", err)
 		return result
 	}
 
-	contentDir := filepath.Join(storageDir, cleanPath(media.Item.Title))
-	if err := os.MkdirAll(contentDir, 0755); err != nil {
-		result.addIssue("directory setup", err)
+	bookDir := filepath.Join(outputDir, sanitizePath(displayName))
+	if err := os.MkdirAll(bookDir, 0755); err != nil {
+		result.addError("create directory", err)
 		return result
 	}
 
-	result.Title = media.Item.Title
-	result.Location = contentDir
+	result.BookName = displayName
+	result.Path = bookDir
 
-	saveResources(contentDir, media, &result)
-
+	downloadAssets(bookDir, bookData, &result)
 	return result
 }
 
-func getMediaData(mediaURL string) (*MediaContent, error) {
-	html, err := getPage(mediaURL)
+func fetchBookData(bookURL string) (*BookData, error) {
+	html, err := downloadPage(bookURL)
 	if err != nil {
-		return nil, fmt.Errorf("page fetch failed: %w", err)
+		return nil, fmt.Errorf("page download failed: %w", err)
 	}
 
-	jsonStr, err := getJSON(html)
+	jsonData, err := extractJSON(html)
 	if err != nil {
-		return nil, fmt.Errorf("JSON extract failed: %w", err)
+		return nil, fmt.Errorf("JSON extraction failed: %w", err)
 	}
 
-	content, err := parseMediaJSON(jsonStr)
+	bookData, err := parseBookJSON(jsonData)
 	if err != nil {
-		return nil, fmt.Errorf("JSON parse failed: %w", err)
+		return nil, fmt.Errorf("JSON parsing failed: %w", err)
 	}
 
-	content.ImageBackup = strings.Split(content.Item.Image, "-")[0] + ".jpg"
+	bookData.CoverAlt = strings.Split(bookData.Book.Cover, "-")[0] + ".jpg"
 
-	if info, err := getInfo(html); err == nil {
-		content.Info = info
+	if desc, err := extractDescription(html); err == nil {
+		bookData.Description = desc
 	}
 
-	return content, nil
+	return bookData, nil
 }
 
-func getPage(url string) (string, error) {
+func downloadPage(url string) (string, error) {
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return "", err
 	}
 
-	// Dynamic User-Agent generation
-	agents := []string{
-		"Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-		"AppleWebKit/537.36 (KHTML, like Gecko)",
-		"Chrome/135.0.0.0 Safari/537.36",
-		"Edg/135.0.0.0",
-	}
-	req.Header.Set("User-Agent", strings.Join(agents, " "))
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Cookie", cookie)
 
-	resp, err := netClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -233,34 +423,36 @@ func getPage(url string) (string, error) {
 	return string(body), nil
 }
 
-func getJSON(html string) (string, error) {
-	matches := jsPattern.FindStringSubmatch(html)
+func extractJSON(html string) (string, error) {
+	matches := jsonRegex.FindStringSubmatch(html)
 	if len(matches) < 2 {
-		return "", errors.New("JSON pattern not found")
+		return "", errors.New("JSON data not found in HTML")
 	}
 	return matches[1], nil
 }
 
-func parseMediaJSON(jsonStr string) (*MediaContent, error) {
-	var data MediaContent
+func parseBookJSON(jsonStr string) (*BookData, error) {
+	var data BookData
 	if err := json.Unmarshal([]byte(jsonStr), &data); err != nil {
 		return nil, err
 	}
 	return &data, nil
 }
 
-func getInfo(html string) (string, error) {
-	matches := infoPattern.FindStringSubmatch(html)
+func extractDescription(html string) (string, error) {
+	matches := descRegex.FindStringSubmatch(html)
 	if len(matches) < 2 {
-		return "", errors.New("info not found")
+		return "", errors.New("description not found")
 	}
+
 	text := regexp.MustCompile(`<[^>]*>`).ReplaceAllString(matches[1], "")
 	return text, nil
 }
 
-func cleanPath(path string) string {
-	safe := invalidPath.ReplaceAllString(path, "_")
+func sanitizePath(path string) string {
+	safe := forbiddenChars.ReplaceAllString(path, "_")
 	safe = strings.Trim(safe, " .")
+
 	reserved := []string{"CON", "PRN", "AUX", "NUL",
 		"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
 		"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"}
@@ -270,42 +462,41 @@ func cleanPath(path string) string {
 			return safe + "_"
 		}
 	}
+
 	return safe
 }
 
-func saveResources(contentDir string, media *MediaContent, result *ContentResult) {
-	// Save cover image
-	if err := fetchResource(
-		[]string{media.ImageBackup, media.Item.Image},
-		filepath.Join(contentDir, "cover.jpg"),
+func downloadAssets(bookDir string, bookData *BookData, result *DownloadResult) {
+	if err := downloadWithFallback(
+		[]string{bookData.CoverAlt, bookData.Book.Cover},
+		filepath.Join(bookDir, "cover.jpg"),
 	); err != nil {
-		result.addIssue("image fetch", err)
+		result.addError("cover download", err)
 	}
 
-	// Save information file
-	if err := saveInfo(contentDir, media); err != nil {
-		result.addIssue("info save", err)
+	if err := saveDescription(bookDir, bookData); err != nil {
+		result.addError("save description", err)
 	}
 
-	// Save audio tracks
-	if err := saveAudio(contentDir, media, result); err != nil {
-		result.addIssue("audio save", err)
+	if err := downloadPlaylist(bookDir, bookData, result); err != nil {
+		result.addError("playlist download", err)
 	}
 }
 
-func fetchResource(sources []string, destination string) error {
-	for _, src := range sources {
-		if src == "" {
+func downloadWithFallback(urls []string, filePath string) error {
+	for _, url := range urls {
+		if url == "" {
 			continue
 		}
-		if err := saveFile(src, destination); err == nil {
+		if err := downloadFile(url, filePath); err == nil {
 			return nil
 		}
+		time.Sleep(500 * time.Millisecond)
 	}
-	return errors.New("all sources failed")
+	return errors.New("all download attempts failed")
 }
 
-func saveInfo(contentDir string, media *MediaContent) error {
+func saveDescription(bookDir string, bookData *BookData) error {
 	getNames := func(data interface{}) string {
 		var names []string
 		switch v := data.(type) {
@@ -329,33 +520,34 @@ func saveInfo(contentDir string, media *MediaContent) error {
 		return strings.Join(names, ", ")
 	}
 
-	info := fmt.Sprintf(
-		"Title: %s\nCreators: %s\nNarrators: %s\n\nDescription:\n%s\n\nSource: %s",
-		media.Item.Title,
-		getNames(media.Item.Creators),
-		getNames(media.Item.Voice),
-		media.Info,
-		media.Item.Link,
+	desc := fmt.Sprintf(
+		"Название: %s\nАвтор(ы): %s\nЧтец(ы): %s\n\nОписание:\n%s\n\nURL: %s",
+		bookData.Book.Name,
+		getNames(bookData.Book.Authors),
+		getNames(bookData.Book.Readers),
+		bookData.Description,
+		bookData.Book.URL,
 	)
 
-	return os.WriteFile(filepath.Join(contentDir, "info.txt"), []byte(info), 0644)
+	return os.WriteFile(filepath.Join(bookDir, "Description.txt"), []byte(desc), 0644)
 }
 
-func saveAudio(contentDir string, media *MediaContent, result *ContentResult) error {
-	if err := processTracks(contentDir, media.Tracks); err == nil {
+func downloadPlaylist(bookDir string, bookData *BookData, result *DownloadResult) error {
+	if err := downloadTracks(bookDir, bookData.Playlist); err == nil {
 		return nil
 	}
-	result.addIssue("primary tracks", errors.New("using fallback tracks"))
-	return processTracks(contentDir, media.CombinedTracks)
+
+	result.addError("main playlist", errors.New("falling back to merged playlist"))
+	return downloadTracks(bookDir, bookData.MergedPlaylist)
 }
 
-func processTracks(contentDir string, tracks []AudioTrack) error {
+func downloadTracks(bookDir string, tracks []Audio) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	var wg sync.WaitGroup
 	errChan := make(chan error, 1)
-	limiter := make(chan struct{}, 4) // Concurrency limit
+	sem := make(chan struct{}, 5)
 
 	for _, track := range tracks {
 		select {
@@ -365,35 +557,35 @@ func processTracks(contentDir string, tracks []AudioTrack) error {
 		}
 
 		wg.Add(1)
-		go func(t AudioTrack) {
+		go func(t Audio) {
 			defer wg.Done()
 
 			select {
-			case limiter <- struct{}{}:
-				defer func() { <-limiter }()
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
 			case <-ctx.Done():
 				return
 			}
 
-			ext := filepath.Ext(t.SRC)
+			ext := filepath.Ext(t.URL)
 			if ext == "" {
 				ext = ".mp3"
 			}
-			filePath := filepath.Join(contentDir, cleanPath(t.Name)+ext)
+			filePath := filepath.Join(bookDir, sanitizePath(t.Title)+ext)
 
 			if _, err := os.Stat(filePath); err == nil {
 				return
 			}
 
-			for attempt := 1; attempt <= maxAttempts; attempt++ {
-				if err := saveFile(t.SRC, filePath); err == nil {
+			for attempt := 1; attempt <= maxRetries; attempt++ {
+				if err := downloadFile(t.URL, filePath); err == nil {
 					return
 				}
-				time.Sleep(retryWait)
+				time.Sleep(retryDelay)
 			}
 
 			select {
-			case errChan <- fmt.Errorf("track %s failed after %d attempts", t.Name, maxAttempts):
+			case errChan <- fmt.Errorf("track %s: download failed after %d attempts", t.Title, maxRetries):
 				cancel()
 			default:
 			}
@@ -411,16 +603,14 @@ func processTracks(contentDir string, tracks []AudioTrack) error {
 	return nil
 }
 
-func saveFile(source, destination string) error {
-	req, err := http.NewRequest("GET", source, nil)
+func downloadFile(url, filePath string) error {
+	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return err
 	}
 
-	// Dynamic User-Agent
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.102 Safari/537.36")
-
-	resp, err := netClient.Do(req)
+	req.Header.Set("User-Agent", userAgent)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -430,7 +620,7 @@ func saveFile(source, destination string) error {
 		return fmt.Errorf("HTTP status %d", resp.StatusCode)
 	}
 
-	file, err := os.Create(destination)
+	file, err := os.Create(filePath)
 	if err != nil {
 		return err
 	}
@@ -440,7 +630,7 @@ func saveFile(source, destination string) error {
 	return err
 }
 
-func cleanURL(rawURL string) (string, error) {
+func normalizeURL(rawURL string) (string, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return "", err
@@ -454,14 +644,14 @@ func cleanURL(rawURL string) (string, error) {
 	return u.String(), nil
 }
 
-// ContentResult contains processing status
-type ContentResult struct {
-	Source   string
-	Title    string
-	Location string
-	Issues   []string
+// DownloadResult contains download status
+type DownloadResult struct {
+	URL      string
+	BookName string
+	Path     string
+	Errors   []string
 }
 
-func (r *ContentResult) addIssue(context string, err error) {
-	r.Issues = append(r.Issues, fmt.Sprintf("%s: %v", context, err))
+func (r *DownloadResult) addError(context string, err error) {
+	r.Errors = append(r.Errors, fmt.Sprintf("%s: %v", context, err))
 }

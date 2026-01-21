@@ -1,2 +1,3 @@
 https://knigavuhe.org/book/some-audiobook/
 https://knigavuhe.org/book/another-book/
+https://knigavuhe.org/serie/some-series/

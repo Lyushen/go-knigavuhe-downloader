@@ -533,12 +533,22 @@ func saveDescription(bookDir string, bookData *BookData) error {
 }
 
 func downloadPlaylist(bookDir string, bookData *BookData, result *DownloadResult) error {
+	// Try main playlist first
 	if err := downloadTracks(bookDir, bookData.Playlist); err == nil {
 		return nil
 	}
 
-	result.addError("main playlist", errors.New("falling back to merged playlist"))
-	return downloadTracks(bookDir, bookData.MergedPlaylist)
+	// Log to console that we are switching strategies, but DO NOT add to result.Errors yet
+	fmt.Printf("⚠️ Main playlist failed for '%s', trying merged playlist...\n", bookData.Book.Name)
+
+	// Try fallback
+	if err := downloadTracks(bookDir, bookData.MergedPlaylist); err != nil {
+		// NOW we add an error, because both methods failed
+		result.addError("playlist download", fmt.Errorf("main and merged playlists failed: %v", err))
+		return err
+	}
+
+	return nil
 }
 
 func downloadTracks(bookDir string, tracks []Audio) error {

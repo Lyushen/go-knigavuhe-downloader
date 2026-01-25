@@ -14,4 +14,4 @@ set GOARCH=amd64
 taskkill /f /im "%GONAME%.exe" 2>nul
 timeout /t 2 /nobreak >nul
 go build -ldflags="-s -w" -o "%GONAME%.exe" main.go
-rem 
+rem

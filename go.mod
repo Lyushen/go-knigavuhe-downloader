@@ -1,3 +1,3 @@
-module github.com/Lyushen/go-knigavuhe-downloader
+module go-knigavuhe
 
-go 1.24.5
+go 1.25.5

@@ -39,8 +39,6 @@ jobs:
         mkdir -p dist
 
         # Reproducible build settings
-        # CGO_ENABLED=0 is critical for Android to avoid libc dependency issues
-        export CGO_ENABLED=0
         export GOFLAGS="-trimpath -mod=readonly"
         export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
 
@@ -72,7 +70,10 @@ jobs:
           fi
 
           echo "Building ${output_name}..."
-          GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="$LDFLAGS" -o "dist/$output_name" .
+
+          # Explicitly set CGO_ENABLED=0 for the build command
+          # This is critical for Android and cross-compilation reliability
+          CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="$LDFLAGS" -o "dist/$output_name" .
         done
 
     - name: Generate build attestation
@@ -129,13 +130,12 @@ jobs:
         cd go-knigavuhe
         git checkout ${{ github.sha }}
 
-        export CGO_ENABLED=0
         export GOFLAGS="-trimpath -mod=readonly"
         export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
 
         # Build for your platform (example for Android)
-        # CHANGED: Updated manual build instruction path to .
-        GOOS=android GOARCH=arm64 go build -ldflags="-s -w -buildid=" -o go-knigavuhe .
+        # We explicitly set CGO_ENABLED=0
+        CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build -ldflags="-s -w -buildid=" -o go-knigavuhe .
 
         # Compare hash with released binary
         sha256sum go-knigavuhe

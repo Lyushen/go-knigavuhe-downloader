@@ -12,6 +12,7 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -29,26 +30,29 @@ jobs:
         if [[ $GITHUB_REF == refs/tags/* ]]; then
           raw_version="${GITHUB_REF#refs/tags/}"
           clean_version="${raw_version#v}"
-          echo "version=$clean_version" >> $GITHUB_OUTPUT
+          echo "version=$clean_version" >> "$GITHUB_OUTPUT"
         else
-          echo "version=dev-$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          echo "version=dev-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
         fi
 
     - name: Build reproducible binaries
       run: |
+        set -euo pipefail
         mkdir -p dist
 
         # Reproducible build settings
         export GOFLAGS="-trimpath -mod=readonly"
         export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
 
-        # Build metadata for transparency
         GIT_COMMIT=$(git rev-parse HEAD)
         BUILD_DATE=$(date -u -d @${SOURCE_DATE_EPOCH} +%Y-%m-%dT%H:%M:%SZ)
         GO_VERSION=$(go version | cut -d' ' -f3)
 
-        # Try different ldflags to avoid AV detection
-        LDFLAGS="-s -w -buildid= -H windowsgui -X main.version=${{ steps.version.outputs.version }} -X main.gitCommit=${GIT_COMMIT} -X main.buildDate=${BUILD_DATE} -X main.goVersion=${GO_VERSION}"
+        BASE_LDFLAGS="-s -w -buildid= \
+          -X main.version=${{ steps.version.outputs.version }} \
+          -X main.gitCommit=${GIT_COMMIT} \
+          -X main.buildDate=${BUILD_DATE} \
+          -X main.goVersion=${GO_VERSION}"
 
         targets=(
           "linux/amd64"
@@ -64,23 +68,42 @@ jobs:
           GOOS=${target%/*}
           GOARCH=${target#*/}
 
-          output_name="go-knigavuhe-${{ steps.version.outputs.version }}-${GOOS}-${GOARCH}"
-          if [ "$GOOS" = "windows" ]; then
-            output_name+=".exe"
+          output="go-knigavuhe-${{ steps.version.outputs.version }}-${GOOS}-${GOARCH}"
+          [[ "$GOOS" == "windows" ]] && output+=".exe"
+
+          if [[ "$GOOS" == "windows" ]]; then
+            LDFLAGS="${BASE_LDFLAGS} -H windowsgui"
+          else
+            LDFLAGS="${BASE_LDFLAGS}"
           fi
 
-          echo "Building ${output_name}..."
+          echo "==> Building ${output}"
+          CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH \
+            go build -ldflags="$LDFLAGS" -o "dist/${output}" .
 
-          # Explicitly set CGO_ENABLED=0 for the build command
-          # This is critical for Android and cross-compilation reliability
-          CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="$LDFLAGS" -o "dist/$output_name" .
+          echo "==> Inspecting ${output}"
+          file "dist/${output}"
+
+          if [[ "$GOOS" == "linux" || "$GOOS" == "android" ]]; then
+            file "dist/${output}" | grep -q ELF || {
+              echo "ERROR: ${output} is not an ELF binary"
+              exit 1
+            }
+            readelf -h "dist/${output}" > /dev/null
+          fi
+
+          if [[ "$GOOS" == "darwin" ]]; then
+            file "dist/${output}" | grep -q "Mach-O" || {
+              echo "ERROR: ${output} is not a Mach-O binary"
+              exit 1
+            }
+          fi
         done
 
     - name: Generate build attestation
       run: |
         cd dist
 
-        # Create detailed build information
         cat > build-info.json << EOF
         {
           "version": "${{ steps.version.outputs.version }}",
@@ -100,47 +123,9 @@ jobs:
         }
         EOF
 
-        # Generate checksums
         sha256sum *.exe > checksums-windows.txt 2>/dev/null || true
         sha256sum go-knigavuhe-*-linux-* go-knigavuhe-*-darwin-* go-knigavuhe-*-android-* > checksums-unix.txt 2>/dev/null || true
         sha256sum * > checksums-all.txt
-
-        # Create verification instructions
-        cat > VERIFY.md << 'EOF'
-        # Verification Instructions
-
-        ## Source Code Verification
-        1. **Commit Hash**: Check that the git commit in `build-info.json` matches the tagged release
-        2. **Workflow**: View the build process at the workflow URL in `build-info.json`
-        3. **Reproducible Build**: Clone the repo at the exact commit and build with identical flags
-
-        ## File Integrity Verification
-        ```bash
-        # Verify checksums (Linux/macOS/Android)
-        sha256sum -c checksums-all.txt
-
-        # Windows PowerShell
-        Get-FileHash *.exe -Algorithm SHA256 | Format-Table
-        # Compare with checksums-windows.txt
-        ```
-
-        ## Reproducible Build Instructions
-        ```bash
-        git clone https://github.com/${{ github.repository }}.git
-        cd go-knigavuhe
-        git checkout ${{ github.sha }}
-
-        export GOFLAGS="-trimpath -mod=readonly"
-        export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
-
-        # Build for your platform (example for Android)
-        # We explicitly set CGO_ENABLED=0
-        CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build -ldflags="-s -w -buildid=" -o go-knigavuhe .
-
-        # Compare hash with released binary
-        sha256sum go-knigavuhe
-        ```
-        EOF
 
     - name: Create Release
       uses: softprops/action-gh-release@v2
@@ -153,52 +138,14 @@ jobs:
           dist/go-knigavuhe-*-android-*
           dist/checksums-*.txt
           dist/build-info.json
-          dist/VERIFY.md
         generate_release_notes: true
-        draft: false
-        prerelease: false
-        body: |
-          ## 🔒 Security & Verification
-
-          **No archives** - All binaries are uploaded directly to reduce AV false positives.
-
-          ### ✅ Verify Authenticity
-          - Check `build-info.json` for build details and workflow link
-          - Verify checksums with `checksums-*.txt` files
-          - View full build log in GitHub Actions
-          - Reproduce the build locally (see `VERIFY.md`)
-
-          ### 🛡️ Anti-virus Warning
-          Some AV software may flag these as suspicious due to network downloading behavior.
-          **This is a false positive.** The source code is fully open and auditable.
-
-          ### 📥 Download Instructions
-
-          **Windows**: Download `go-knigavuhe-*-windows-amd64.exe`
-          **Linux**: Download `go-knigavuhe-*-linux-amd64`
-          **macOS**: Download `go-knigavuhe-*-darwin-amd64`
-          **Android**: Download `go-knigavuhe-*-android-arm64`
-
-          ### 🔍 Usage
-          ```bash
-          ./go-knigavuhe <output-directory> <urls-file>
-          ```
-
-          Built from commit: `${{ github.sha }}`
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Upload artifacts (for manual runs)
+    - name: Upload artifacts (manual runs)
       if: github.event_name == 'workflow_dispatch'
       uses: actions/upload-artifact@v4
       with:
         name: release-${{ steps.version.outputs.version }}
-        path: |
-          dist/*.exe
-          dist/go-knigavuhe-*-linux-*
-          dist/go-knigavuhe-*-darwin-*
-          dist/go-knigavuhe-*-android-*
-          dist/checksums-*.txt
-          dist/build-info.json
-          dist/VERIFY.md
+        path: dist/
         retention-days: 30

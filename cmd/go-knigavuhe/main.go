@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -82,24 +83,37 @@ var (
 		},
 	}
 )
+var verboseMode bool
+
+func debugLog(format string, v ...interface{}) {
+	if verboseMode {
+		log.Printf("[DEBUG] "+format, v...)
+	}
+}
 
 func main() {
-	if len(os.Args) < 3 {
+	// 1. Setup Flags
+	flag.BoolVar(&verboseMode, "verbose", false, "Show detailed technical logs")
+	flag.Parse()
+
+	// 2. Validate Arguments (use flag.Args() instead of os.Args)
+	args := flag.Args()
+	if len(args) < 2 {
 		fmt.Println("Usage:")
-		fmt.Println("  For series: audiobook-downloader <output-dir> <series-url>")
-		fmt.Println("  For file:   audiobook-downloader <output-dir> <url-file.txt>")
+		fmt.Println("  For series: audiobook-downloader <output-dir> <series-url> [-verbose]")
+		fmt.Println("  For file:   audiobook-downloader <output-dir> <url-file.txt> [-verbose]")
 		fmt.Println("  <output-dir>   : Directory to save audiobooks")
 		os.Exit(1)
 	}
 
-	outputDir := os.Args[1]
+	outputDir := args[0]
+	inputArg := args[1]
+
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
 		log.Fatalf("Error creating output directory: %v", err)
 	}
 
-	inputArg := os.Args[2]
 	var results []DownloadResult
-
 	// Check if input is a file
 	if strings.HasSuffix(strings.ToLower(inputArg), ".txt") || fileExists(inputArg) {
 		fmt.Printf("📄 Reading URLs from file: %s\n", inputArg)
@@ -533,33 +547,50 @@ func saveDescription(bookDir string, bookData *BookData) error {
 }
 
 func downloadPlaylist(bookDir string, bookData *BookData, result *DownloadResult) error {
-	// Try main playlist first
-	if err := downloadTracks(bookDir, bookData.Playlist); err == nil {
+	// DEBUG: Inspect the data structure
+	debugLog("Playlist Check for: %s", bookData.Book.Name)
+	debugLog(" > Standard Tracks: %d", len(bookData.Playlist))
+	debugLog(" > Merged Tracks:   %d", len(bookData.MergedPlaylist))
+
+	if len(bookData.Playlist) > 0 {
+		debugLog(" > Sample Track URL: %s", bookData.Playlist[0].URL)
+	}
+
+	// Attempt 1: Standard Playlist
+	err := downloadTracks(bookDir, bookData.Playlist, "STANDARD")
+	if err == nil {
 		return nil
 	}
 
-	// Log to console that we are switching strategies, but DO NOT add to result.Errors yet
-	fmt.Printf("⚠️ Main playlist failed for '%s', trying merged playlist...\n", bookData.Book.Name)
+	// Log technical error only in verbose mode
+	debugLog("🔴 Standard Playlist Failed: %v", err)
 
-	// Try fallback
-	if err := downloadTracks(bookDir, bookData.MergedPlaylist); err != nil {
-		// NOW we add an error, because both methods failed
-		result.addError("playlist download", fmt.Errorf("main and merged playlists failed: %v", err))
+	// Inform user cleanly that we are falling back
+	fmt.Printf("   ⚠️  Standard download failed, trying merged file...\n")
+
+	// Attempt 2: Merged Playlist
+	if err := downloadTracks(bookDir, bookData.MergedPlaylist, "MERGED"); err != nil {
+		// Only add error to result if BOTH fail
+		result.addError("playlist download", fmt.Errorf("ALL methods failed. Merged error: %v", err))
 		return err
 	}
 
 	return nil
 }
 
-func downloadTracks(bookDir string, tracks []Audio) error {
+func downloadTracks(bookDir string, tracks []Audio, sourceType string) error {
+	if len(tracks) == 0 {
+		return fmt.Errorf("track list is empty")
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	var wg sync.WaitGroup
 	errChan := make(chan error, 1)
-	sem := make(chan struct{}, 5)
+	sem := make(chan struct{}, 5) // Concurrency limit
 
-	for _, track := range tracks {
+	for i, track := range tracks {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -567,7 +598,7 @@ func downloadTracks(bookDir string, tracks []Audio) error {
 		}
 
 		wg.Add(1)
-		go func(t Audio) {
+		go func(idx int, t Audio) {
 			defer wg.Done()
 
 			select {
@@ -577,29 +608,41 @@ func downloadTracks(bookDir string, tracks []Audio) error {
 				return
 			}
 
-			ext := filepath.Ext(t.URL)
+			// --- FIX: Remove query parameters like ?1 from URL ---
+			cleanURL := strings.Split(t.URL, "?")[0]
+			ext := filepath.Ext(cleanURL)
 			if ext == "" {
 				ext = ".mp3"
 			}
+
+			// Sanitize filename
 			filePath := filepath.Join(bookDir, sanitizePath(t.Title)+ext)
 
 			if _, err := os.Stat(filePath); err == nil {
-				return
+				return // File exists
 			}
 
+			var lastErr error
 			for attempt := 1; attempt <= maxRetries; attempt++ {
-				if err := downloadFile(t.URL, filePath); err == nil {
+				// We use the verbose downloader helper
+				if err := downloadFileVerbose(t.URL, filePath); err == nil {
 					return
+				} else {
+					lastErr = err
+					// Only log retries in verbose mode
+					if idx == 0 {
+						debugLog("[%s] Track 1 Retry %d/%d failed: %v", sourceType, attempt, maxRetries, err)
+					}
+					time.Sleep(retryDelay)
 				}
-				time.Sleep(retryDelay)
 			}
 
 			select {
-			case errChan <- fmt.Errorf("track %s: download failed after %d attempts", t.Title, maxRetries):
+			case errChan <- fmt.Errorf("track '%s' failed: %w", t.Title, lastErr):
 				cancel()
 			default:
 			}
-		}(track)
+		}(i, track)
 	}
 
 	go func() {
@@ -610,6 +653,51 @@ func downloadTracks(bookDir string, tracks []Audio) error {
 	if err := <-errChan; err != nil {
 		return err
 	}
+	return nil
+}
+
+func downloadFileVerbose(url, filePath string) error {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return fmt.Errorf("req build error: %w", err)
+	}
+
+	req.Header.Set("User-Agent", userAgent)
+	// Some sites require Referer to allow direct mp3 downloads
+	req.Header.Set("Referer", "https://knigavuhe.org/")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("network error: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		// DEBUG 4: Capture the HTTP Code
+		return fmt.Errorf("HTTP %d (%s)", resp.StatusCode, http.StatusText(resp.StatusCode))
+	}
+
+	// Check for zero-byte files (common soft-fail)
+	if resp.ContentLength == 0 {
+		return fmt.Errorf("HTTP body is empty (Content-Length: 0)")
+	}
+
+	file, err := os.Create(filePath)
+	if err != nil {
+		return fmt.Errorf("file create error: %w", err)
+	}
+	defer file.Close()
+
+	n, err := io.Copy(file, resp.Body)
+	if err != nil {
+		return fmt.Errorf("io.Copy error: %w", err)
+	}
+
+	if n == 0 {
+		os.Remove(filePath) // Cleanup empty file
+		return fmt.Errorf("wrote 0 bytes")
+	}
+
 	return nil
 }
 

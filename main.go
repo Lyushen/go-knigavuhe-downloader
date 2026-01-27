@@ -74,12 +74,47 @@ var (
 	bookItemRegex  = regexp.MustCompile(`(?s)<div class="bookitem">(.*?)</div>\s*</div>`)
 	bookURLRegex   = regexp.MustCompile(`(?s)class="bookitem_cover"\s+href="/(book/[^"]+)"`)
 	bookIndexRegex = regexp.MustCompile(`(?s)<span class="bookitem_serie_index">\s*([\d\.]+)\.\s*</span>`)
-	bookTitleRegex = regexp.MustCompile(`(?s)<span class="bookitem_serie_index">\s*[\d\.]+\.\s*</span>\s*([^<]+)`)
-	httpClient     = &http.Client{
+	bookTitleRegex = regexp.MustCompile(`(?s)<span class="bookitem_serie_index">\s*[\d\.]+\.\s*</span>\s*([^<]+)`)	
+	// Custom Dialer that uses the fallback DNS logic
+	customDialer = &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+
+	httpClient = &http.Client{
 		Timeout: 30 * time.Second,
 		Transport: &http.Transport{
 			MaxIdleConns:    maxIdleConns,
 			IdleConnTimeout: 60 * time.Second,
+			// Override DialContext to perform DNS lookup manually
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				host, port, err := net.SplitHostPort(addr)
+				if err != nil {
+					return nil, err
+				}
+
+				// Check if host is already an IP
+				if net.ParseIP(host) != nil {
+					return customDialer.DialContext(ctx, network, addr)
+				}
+
+				// Perform DNS Lookup with Fallback
+				ips, err := lookupIPWithFallback(ctx, host)
+				if err != nil {
+					return nil, err
+				}
+
+				// Try to dial the first resolved IP
+				// (We reconstruct the address using the resolved IP and original port)
+				firstIP := ips[0]
+				
+				// Handle IPv6 literal formatting for the URL if necessary
+				if strings.Contains(firstIP, ":") {
+					firstIP = "[" + firstIP + "]"
+				}
+				
+				return customDialer.DialContext(ctx, network, firstIP+":"+port)
+			},
 		},
 	}
 )
@@ -89,6 +124,57 @@ func debugLog(format string, v ...interface{}) {
 	if verboseMode {
 		log.Printf("[DEBUG] "+format, v...)
 	}
+}
+// lookupIPWithFallback attempts to resolve a hostname using multiple DNS providers
+func lookupIPWithFallback(ctx context.Context, host string) ([]string, error) {
+	// 1. Define our specific resolvers
+	dnsProviders := []struct {
+		name     string
+		resolver *net.Resolver
+	}{
+		{
+			name:     "System",
+			resolver: net.DefaultResolver,
+		},
+		{
+			name: "Google (8.8.8.8)",
+			resolver: &net.Resolver{
+				PreferGo: true,
+				Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+					d := net.Dialer{Timeout: 2 * time.Second}
+					return d.DialContext(ctx, "udp", "8.8.8.8:53")
+				},
+			},
+		},
+		{
+			name: "Cloudflare (1.1.1.1)",
+			resolver: &net.Resolver{
+				PreferGo: true,
+				Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+					d := net.Dialer{Timeout: 2 * time.Second}
+					return d.DialContext(ctx, "udp", "1.1.1.1:53")
+				},
+			},
+		},
+	}
+
+	var lastErr error
+	
+	// 2. Iterate through providers
+	for _, provider := range dnsProviders {
+		// Use LookupIPAddr to get specific IP types if needed, but LookupHost is simpler for general use
+		ips, err := provider.resolver.LookupHost(ctx, host)
+		if err == nil && len(ips) > 0 {
+			if verboseMode && provider.name != "System" {
+				// Only log if we had to fallback, to keep output clean
+				fmt.Printf("DEBUG: Resolved %s using %s\n", host, provider.name)
+			}
+			return ips, nil
+		}
+		lastErr = err
+	}
+
+	return nil, fmt.Errorf("all DNS resolvers failed: %v", lastErr)
 }
 
 func main() {

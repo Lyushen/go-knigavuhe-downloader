@@ -1,4 +1,5 @@
 audiobooks
-go-knigavuhe.exe
+*.exe
 books2.txt
 audiobooks2
+/go-knigavuhe

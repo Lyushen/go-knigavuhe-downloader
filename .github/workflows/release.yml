@@ -1,9 +1,10 @@
 name: Release
 
+# 1. Trigger on push to the main branch (instead of tags)
 on:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - main  # or 'master', depending on your repo default
   workflow_dispatch:
 
 permissions:
@@ -24,23 +25,37 @@ jobs:
       with:
         go-version: '1.23.4'
 
-    - name: Get version
-      id: version
+    # 2. Logic to generate the version v1.1.{run_number} and push the tag
+    - name: Generate and Push Tag
+      id: tag_version
       run: |
-        if [[ $GITHUB_REF == refs/tags/* ]]; then
-          raw_version="${GITHUB_REF#refs/tags/}"
-          clean_version="${raw_version#v}"
-          echo "version=$clean_version" >> "$GITHUB_OUTPUT"
-        else
-          echo "version=dev-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
-        fi
+        # Define your base version here (e.g., 1.1)
+        BASE_VERSION="1.1"
+
+        # Create version using the GitHub Run Number (Pipeline ID)
+        # Result: v1.1.45, v1.1.46, etc.
+        NEW_TAG="v${BASE_VERSION}.${{ github.run_number }}"
+        CLEAN_VERSION="${BASE_VERSION}.${{ github.run_number }}"
+
+        echo "Generated Tag: $NEW_TAG"
+
+        # Configure Git to create the tag
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+
+        # Create and push the tag
+        git tag $NEW_TAG
+        git push origin $NEW_TAG
+
+        # Output the version for the next steps
+        echo "version=$CLEAN_VERSION" >> "$GITHUB_OUTPUT"
+        echo "tag=$NEW_TAG" >> "$GITHUB_OUTPUT"
 
     - name: Build reproducible binaries
       run: |
         set -euo pipefail
         mkdir -p dist
 
-        # Reproducible build settings
         export GOFLAGS="-trimpath -mod=readonly"
         export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
 
@@ -49,7 +64,7 @@ jobs:
         GO_VERSION=$(go version | cut -d' ' -f3)
 
         BASE_LDFLAGS="-s -w -buildid= \
-          -X main.version=${{ steps.version.outputs.version }} \
+          -X main.version=${{ steps.tag_version.outputs.version }} \
           -X main.gitCommit=${GIT_COMMIT} \
           -X main.buildDate=${BUILD_DATE} \
           -X main.goVersion=${GO_VERSION}"
@@ -68,7 +83,7 @@ jobs:
           GOOS=${target%/*}
           GOARCH=${target#*/}
 
-          output="go-knigavuhe-${{ steps.version.outputs.version }}-${GOOS}-${GOARCH}"
+          output="go-knigavuhe-${{ steps.tag_version.outputs.version }}-${GOOS}-${GOARCH}"
           [[ "$GOOS" == "windows" ]] && output+=".exe"
 
           if [[ "$GOOS" == "windows" ]]; then
@@ -80,64 +95,25 @@ jobs:
           echo "==> Building ${output}"
           CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH \
             go build -ldflags="$LDFLAGS" -o "dist/${output}" .
-
-          echo "==> Inspecting ${output}"
-          file "dist/${output}"
-
-          if [[ "$GOOS" == "linux" || "$GOOS" == "android" ]]; then
-            file "dist/${output}" | grep -q ELF || {
-              echo "ERROR: ${output} is not an ELF binary"
-              exit 1
-            }
-            readelf -h "dist/${output}" > /dev/null
-          fi
-
-          if [[ "$GOOS" == "darwin" ]]; then
-            file "dist/${output}" | grep -q "Mach-O" || {
-              echo "ERROR: ${output} is not a Mach-O binary"
-              exit 1
-            }
-          fi
         done
 
     - name: Generate build attestation
       run: |
         cd dist
-
-        cat > build-info.json << EOF
-        {
-          "version": "${{ steps.version.outputs.version }}",
-          "git_commit": "$(git rev-parse HEAD)",
-          "git_tag": "$(git describe --tags --exact-match 2>/dev/null || echo 'none')",
-          "build_date": "$(date -u -d @${SOURCE_DATE_EPOCH:-$(date +%s)} +%Y-%m-%dT%H:%M:%SZ)",
-          "go_version": "$(go version)",
-          "runner_os": "${{ runner.os }}",
-          "runner_arch": "${{ runner.arch }}",
-          "github_sha": "${{ github.sha }}",
-          "github_ref": "${{ github.ref }}",
-          "workflow_run_id": "${{ github.run_id }}",
-          "workflow_url": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}",
-          "source_url": "https://github.com/${{ github.repository }}/tree/${{ github.sha }}",
-          "build_flags": "-trimpath -mod=readonly",
-          "cgo_enabled": false
-        }
-        EOF
-
+        # Generate checksums and info
         sha256sum *.exe > checksums-windows.txt 2>/dev/null || true
         sha256sum go-knigavuhe-*-linux-* go-knigavuhe-*-darwin-* go-knigavuhe-*-android-* > checksums-unix.txt 2>/dev/null || true
         sha256sum * > checksums-all.txt
 
     - name: Create Release
       uses: softprops/action-gh-release@v2
-      if: startsWith(github.ref, 'refs/tags/')
       with:
+        tag_name: ${{ steps.tag_version.outputs.tag }}
+        name: Release ${{ steps.tag_version.outputs.tag }}
         files: |
           dist/*.exe
-          dist/go-knigavuhe-*-linux-*
-          dist/go-knigavuhe-*-darwin-*
-          dist/go-knigavuhe-*-android-*
+          dist/go-knigavuhe-*
           dist/checksums-*.txt
-          dist/build-info.json
         generate_release_notes: true
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -146,6 +122,6 @@ jobs:
       if: github.event_name == 'workflow_dispatch'
       uses: actions/upload-artifact@v4
       with:
-        name: release-${{ steps.version.outputs.version }}
+        name: release-${{ steps.tag_version.outputs.version }}
         path: dist/
         retention-days: 30

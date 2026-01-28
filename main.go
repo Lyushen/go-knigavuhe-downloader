@@ -9,9 +9,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
-	"net"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -75,7 +75,7 @@ var (
 	bookItemRegex  = regexp.MustCompile(`(?s)<div class="bookitem">(.*?)</div>\s*</div>`)
 	bookURLRegex   = regexp.MustCompile(`(?s)class="bookitem_cover"\s+href="/(book/[^"]+)"`)
 	bookIndexRegex = regexp.MustCompile(`(?s)<span class="bookitem_serie_index">\s*([\d\.]+)\.\s*</span>`)
-	bookTitleRegex = regexp.MustCompile(`(?s)<span class="bookitem_serie_index">\s*[\d\.]+\.\s*</span>\s*([^<]+)`)	
+	bookTitleRegex = regexp.MustCompile(`(?s)<span class="bookitem_serie_index">\s*[\d\.]+\.\s*</span>\s*([^<]+)`)
 	// Custom Dialer that uses the fallback DNS logic
 	customDialer = &net.Dialer{
 		Timeout:   30 * time.Second,
@@ -108,12 +108,12 @@ var (
 				// Try to dial the first resolved IP
 				// (We reconstruct the address using the resolved IP and original port)
 				firstIP := ips[0]
-				
+
 				// Handle IPv6 literal formatting for the URL if necessary
 				if strings.Contains(firstIP, ":") {
 					firstIP = "[" + firstIP + "]"
 				}
-				
+
 				return customDialer.DialContext(ctx, network, firstIP+":"+port)
 			},
 		},
@@ -126,6 +126,7 @@ func debugLog(format string, v ...interface{}) {
 		log.Printf("[DEBUG] "+format, v...)
 	}
 }
+
 // lookupIPWithFallback attempts to resolve a hostname using multiple DNS providers
 func lookupIPWithFallback(ctx context.Context, host string) ([]string, error) {
 	// 1. Define our specific resolvers
@@ -160,7 +161,7 @@ func lookupIPWithFallback(ctx context.Context, host string) ([]string, error) {
 	}
 
 	var lastErr error
-	
+
 	// 2. Iterate through providers
 	for _, provider := range dnsProviders {
 		// Use LookupIPAddr to get specific IP types if needed, but LookupHost is simpler for general use
@@ -360,7 +361,7 @@ func extractBooksFromSeries(seriesURL string) ([]BookInfo, error) {
 		}
 		title := strings.TrimSpace(titleMatch[1])
 
-		displayName := fmt.Sprintf("%s. %s", index, title)
+		displayName := fmt.Sprintf("%s_%s", index, title)
 		books = append(books, BookInfo{
 			URL:         "https://knigavuhe.org/" + urlMatch[1],
 			DisplayName: displayName,
@@ -551,9 +552,21 @@ func extractDescription(html string) (string, error) {
 }
 
 func sanitizePath(path string) string {
+	// 1. Replace forbidden filesystem characters (<>:"/\|?*) with "_"
 	safe := forbiddenChars.ReplaceAllString(path, "_")
-	safe = strings.Trim(safe, " .")
 
+	// 2. Replace spaces and all whitespace (tabs, newlines) with "_"
+	whitespace := regexp.MustCompile(`\s+`)
+	safe = whitespace.ReplaceAllString(safe, "_")
+
+	// 3. Collapse multiple underscores into one (e.g., "Book__Name" -> "Book_Name")
+	multiUnderscore := regexp.MustCompile(`_+`)
+	safe = multiUnderscore.ReplaceAllString(safe, "_")
+
+	// 4. Trim leading/trailing dots, spaces, and underscores
+	safe = strings.Trim(safe, " ._")
+
+	// 5. Handle Windows reserved filenames
 	reserved := []string{"CON", "PRN", "AUX", "NUL",
 		"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
 		"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"}
@@ -562,6 +575,11 @@ func sanitizePath(path string) string {
 		if strings.EqualFold(safe, r) {
 			return safe + "_"
 		}
+	}
+
+	// 6. Ensure the filename isn't empty after sanitization
+	if safe == "" {
+		safe = "audiobook_file"
 	}
 
 	return safe
@@ -701,7 +719,7 @@ func downloadTracks(bookDir string, tracks []Audio, sourceType string) error {
 			if ext == "" {
 				ext = ".mp3"
 			}
-
+			ext = strings.ToLower(ext)
 			// Sanitize filename
 			filePath := filepath.Join(bookDir, sanitizePath(t.Title)+ext)
 

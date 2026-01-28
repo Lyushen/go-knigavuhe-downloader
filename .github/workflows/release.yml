@@ -110,10 +110,11 @@ jobs:
       with:
         tag_name: ${{ steps.tag_version.outputs.tag }}
         name: Release ${{ steps.tag_version.outputs.tag }}
+        # FIX: Simplified file list to avoid duplicates
         files: |
-          dist/*.exe
           dist/go-knigavuhe-*
           dist/checksums-*.txt
+          dist/build-info.json
         generate_release_notes: true
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

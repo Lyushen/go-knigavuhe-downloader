@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -21,6 +22,17 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/minio/selfupdate"
+)
+
+// Injected via -ldflags
+var (
+	version   = "dev"
+	gitCommit = "none"
+	buildDate = "unknown"
+	goVersion = "unknown"
+	updateURL = ""
 )
 
 // Person represents author/reader
@@ -181,15 +193,65 @@ func lookupIPWithFallback(ctx context.Context, host string) ([]string, error) {
 
 func main() {
 	// 1. Setup Flags
+	var showVersion bool
+	var waitUpdate bool
+
 	flag.BoolVar(&verboseMode, "verbose", false, "Show detailed technical logs")
+	flag.BoolVar(&showVersion, "version", false, "Print version information and exit")
+	flag.BoolVar(&waitUpdate, "wait-update", false, "Wait for a new version to be available, update, and then exit")
 	flag.Parse()
 
-	// 2. Validate Arguments (use flag.Args() instead of os.Args)
+	if showVersion {
+		fmt.Printf("Audiobook Downloader\n")
+		fmt.Printf("Version:    %s\n", version)
+		fmt.Printf("Git Commit: %s\n", gitCommit)
+		fmt.Printf("Build Date: %s\n", buildDate)
+		fmt.Printf("Go Version: %s\n", goVersion)
+		if updateURL != "" {
+			fmt.Printf("Update URL: %s\n", updateURL)
+		}
+		os.Exit(0)
+	}
+
+	// 2. Self-Update Logic
+	if updateURL != "" {
+		if waitUpdate {
+			fmt.Printf("⏳ Waiting for update from %s...\n", updateURL)
+			for {
+				updated, err := checkAndApplyUpdate()
+				if err != nil {
+					debugLog("Update check failed: %v", err)
+				} else if updated {
+					fmt.Println("✅ Update applied successfully. Exiting to restart.")
+					os.Exit(0)
+				}
+				time.Sleep(5 * time.Second)
+			}
+		} else {
+			// Normal startup check
+			updated, err := checkAndApplyUpdate()
+			if err != nil {
+				if verboseMode {
+					fmt.Printf("⚠️ Update check failed: %v\n", err)
+				}
+			} else if updated {
+				fmt.Println("✅ Application updated. Exiting to restart.")
+				os.Exit(0)
+			}
+		}
+	} else if waitUpdate {
+		log.Fatal("❌ Cannot wait for update: No update URL injected at build time.")
+	}
+
+	// 3. Validate Arguments (use flag.Args() instead of os.Args)
 	args := flag.Args()
 	if len(args) < 2 {
 		fmt.Println("Usage:")
 		fmt.Println("  For series: audiobook-downloader <output-dir> <series-url> [-verbose]")
 		fmt.Println("  For file:   audiobook-downloader <output-dir> <url-file.txt> [-verbose]")
+		fmt.Println("  Flags:")
+		fmt.Println("    -wait-update : Loop and wait for update before exiting")
+		fmt.Println("    -version     : Show version info")
 		fmt.Println("  <output-dir>   : Directory to save audiobooks")
 		os.Exit(1)
 	}
@@ -274,6 +336,75 @@ func main() {
 		}
 	}
 	fmt.Println(strings.Repeat("=", 60))
+}
+
+// checkAndApplyUpdate checks for a new version and applies it if available.
+// Returns true if an update was applied.
+func checkAndApplyUpdate() (bool, error) {
+	// 1. Check version file
+	versionURL := strings.TrimRight(updateURL, "/") + "/version.txt"
+	req, err := http.NewRequest("GET", versionURL, nil)
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("User-Agent", userAgent)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("version check HTTP %d", resp.StatusCode)
+	}
+
+	remoteVersionBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false, err
+	}
+	remoteVersion := string(bytes.TrimSpace(remoteVersionBytes))
+
+	// Simple string comparison.
+	// NOTE: If you need semantic version logic, use "github.com/hashicorp/go-version"
+	if remoteVersion == "" || remoteVersion == version {
+		return false, nil
+	}
+
+	fmt.Printf("⬆️  New version found: %s (Current: %s). Updating...\n", remoteVersion, version)
+
+	// 2. Download binary
+	binName := fmt.Sprintf("audiobook-downloader-%s-%s", runtime.GOOS, runtime.GOARCH)
+	if runtime.GOOS == "windows" {
+		binName += ".exe"
+	}
+	binURL := strings.TrimRight(updateURL, "/") + "/" + binName
+
+	binReq, err := http.NewRequest("GET", binURL, nil)
+	if err != nil {
+		return false, err
+	}
+	binReq.Header.Set("User-Agent", userAgent)
+
+	binResp, err := httpClient.Do(binReq)
+	if err != nil {
+		return false, err
+	}
+	defer binResp.Body.Close()
+
+	if binResp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("binary download HTTP %d", binResp.StatusCode)
+	}
+
+	// 3. Apply update
+	err = selfupdate.Apply(binResp.Body, selfupdate.Options{})
+	if err != nil {
+		// If the update failed, we might need to rollback or just report error
+		// selfupdate handles rollback of the binary file automatically in most cases
+		return false, fmt.Errorf("failed to apply update: %w", err)
+	}
+
+	return true, nil
 }
 
 func fileExists(filename string) bool {

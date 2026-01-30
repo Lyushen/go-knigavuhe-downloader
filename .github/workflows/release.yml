@@ -1,10 +1,10 @@
 name: Release
 
-# 1. Trigger on push to the main branch (instead of tags)
+# 1. Trigger on push to the main branch
 on:
   push:
     branches:
-      - main  # or 'master', depending on your repo default
+      - main
   workflow_dispatch:
 
 permissions:
@@ -63,11 +63,18 @@ jobs:
         BUILD_DATE=$(date -u -d @${SOURCE_DATE_EPOCH} +%Y-%m-%dT%H:%M:%SZ)
         GO_VERSION=$(go version | cut -d' ' -f3)
 
+        # ---------------------------------------------------------------------
+        # Construct the Update URL dynamically based on the repository
+        # This results in: https://github.com/<user>/<repo>/releases/latest/download
+        # ---------------------------------------------------------------------
+        UPDATE_BASE_URL="https://github.com/${{ github.repository }}/releases/latest/download"
+
         BASE_LDFLAGS="-s -w -buildid= \
           -X main.version=${{ steps.tag_version.outputs.version }} \
           -X main.gitCommit=${GIT_COMMIT} \
           -X main.buildDate=${BUILD_DATE} \
-          -X main.goVersion=${GO_VERSION}"
+          -X main.goVersion=${GO_VERSION} \
+          -X main.updateURL=${UPDATE_BASE_URL}"
 
         targets=(
           "linux/amd64"
@@ -83,7 +90,11 @@ jobs:
           GOOS=${target%/*}
           GOARCH=${target#*/}
 
-          output="go-knigavuhe-${{ steps.tag_version.outputs.version }}-${GOOS}-${GOARCH}"
+          # -------------------------------------------------------------------
+          # Generate Static Filename (No Version Number)
+          # Example: go-knigavuhe-linux-amd64 or go-knigavuhe-windows-amd64.exe
+          # -------------------------------------------------------------------
+          output="go-knigavuhe-${GOOS}-${GOARCH}"
           [[ "$GOOS" == "windows" ]] && output+=".exe"
 
           if [[ "$GOOS" == "windows" ]]; then
@@ -96,6 +107,12 @@ jobs:
           CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH \
             go build -ldflags="$LDFLAGS" -o "dist/${output}" .
         done
+
+        # ---------------------------------------------------------------------
+        # Create version.txt
+        # The app will download this file first to check if update is needed.
+        # ---------------------------------------------------------------------
+        echo "${{ steps.tag_version.outputs.version }}" > dist/version.txt
 
     - name: Generate build attestation
       run: |
@@ -110,11 +127,10 @@ jobs:
       with:
         tag_name: ${{ steps.tag_version.outputs.tag }}
         name: Release ${{ steps.tag_version.outputs.tag }}
-        # FIX: Simplified file list to avoid duplicates
         files: |
           dist/go-knigavuhe-*
           dist/checksums-*.txt
-          dist/build-info.json
+          dist/version.txt
         generate_release_notes: true
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -125,4 +141,4 @@ jobs:
       with:
         name: release-${{ steps.tag_version.outputs.version }}
         path: dist/
-        retention-days: 30
+        retention-days: 7

@@ -1,6 +1,5 @@
 name: Release
 
-# 1. Trigger on push to the main branch
 on:
   push:
     branches:
@@ -10,135 +9,242 @@ on:
 permissions:
   contents: write
 
+env:
+  # base version portion (used to generate v1.1.${{ github.run_number }})
+  BASE_VERSION: "1.1"
+
 jobs:
   release:
     runs-on: ubuntu-latest
-
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: '1.23.4'
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.4'
 
-    # 2. Logic to generate the version v1.1.{run_number} and push the tag
-    - name: Generate and Push Tag
-      id: tag_version
-      run: |
-        # Define your base version here (e.g., 1.1)
-        BASE_VERSION="1.1"
+      - name: Generate and Push Tag
+        id: tag_version
+        run: |
+          set -euo pipefail
 
-        # Create version using the GitHub Run Number (Pipeline ID)
-        # Result: v1.1.45, v1.1.46, etc.
-        NEW_TAG="v${BASE_VERSION}.${{ github.run_number }}"
-        CLEAN_VERSION="${BASE_VERSION}.${{ github.run_number }}"
+          NEW_TAG="v${BASE_VERSION}.${{ github.run_number }}"
+          CLEAN_VERSION="${BASE_VERSION}.${{ github.run_number }}"
 
-        echo "Generated Tag: $NEW_TAG"
+          echo "Generated Tag: $NEW_TAG"
 
-        # Configure Git to create the tag
-        git config user.name "github-actions[bot]"
-        git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
-        # Create and push the tag
-        git tag $NEW_TAG
-        git push origin $NEW_TAG
-
-        # Output the version for the next steps
-        echo "version=$CLEAN_VERSION" >> "$GITHUB_OUTPUT"
-        echo "tag=$NEW_TAG" >> "$GITHUB_OUTPUT"
-
-    - name: Build reproducible binaries
-      run: |
-        set -euo pipefail
-        mkdir -p dist
-
-        export GOFLAGS="-trimpath -mod=readonly"
-        export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
-
-        GIT_COMMIT=$(git rev-parse HEAD)
-        BUILD_DATE=$(date -u -d @${SOURCE_DATE_EPOCH} +%Y-%m-%dT%H:%M:%SZ)
-        GO_VERSION=$(go version | cut -d' ' -f3)
-
-        # ---------------------------------------------------------------------
-        # Construct the Update URL dynamically based on the repository
-        # This results in: https://github.com/<user>/<repo>/releases/latest/download
-        # ---------------------------------------------------------------------
-        UPDATE_BASE_URL="https://github.com/${{ github.repository }}/releases/latest/download"
-
-        BASE_LDFLAGS="-s -w -buildid= \
-          -X main.version=${{ steps.tag_version.outputs.version }} \
-          -X main.gitCommit=${GIT_COMMIT} \
-          -X main.buildDate=${BUILD_DATE} \
-          -X main.goVersion=${GO_VERSION} \
-          -X main.updateURL=${UPDATE_BASE_URL}"
-
-        targets=(
-          "linux/amd64"
-          "linux/arm64"
-          "windows/amd64"
-          "windows/arm64"
-          "darwin/amd64"
-          "darwin/arm64"
-          "android/arm64"
-        )
-
-        for target in "${targets[@]}"; do
-          GOOS=${target%/*}
-          GOARCH=${target#*/}
-
-          # -------------------------------------------------------------------
-          # Generate Static Filename (No Version Number)
-          # Example: go-knigavuhe-linux-amd64 or go-knigavuhe-windows-amd64.exe
-          # -------------------------------------------------------------------
-          output="go-knigavuhe-${GOOS}-${GOARCH}"
-          [[ "$GOOS" == "windows" ]] && output+=".exe"
-
-          if [[ "$GOOS" == "windows" ]]; then
-            LDFLAGS="${BASE_LDFLAGS} -H windowsgui"
+          # Create tag only if it doesn't already exist (safe for re-runs)
+          if git rev-parse --verify --quiet "refs/tags/$NEW_TAG" >/dev/null; then
+            echo "Tag $NEW_TAG already exists; skipping tag creation."
           else
-            LDFLAGS="${BASE_LDFLAGS}"
+            git tag "$NEW_TAG"
+            git push origin "$NEW_TAG"
           fi
 
-          echo "==> Building ${output}"
-          CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH \
-            go build -ldflags="$LDFLAGS" -o "dist/${output}" .
-        done
+          echo "version=$CLEAN_VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$NEW_TAG" >> "$GITHUB_OUTPUT"
 
-        # ---------------------------------------------------------------------
-        # Create version.txt
-        # The app will download this file first to check if update is needed.
-        # ---------------------------------------------------------------------
-        echo "${{ steps.tag_version.outputs.version }}" > dist/version.txt
+      - name: Build reproducible binaries
+        id: build
+        run: |
+          set -euo pipefail
 
-    - name: Generate build attestation
-      run: |
-        cd dist
-        # Generate checksums and info
-        sha256sum *.exe > checksums-windows.txt 2>/dev/null || true
-        sha256sum go-knigavuhe-*-linux-* go-knigavuhe-*-darwin-* go-knigavuhe-*-android-* > checksums-unix.txt 2>/dev/null || true
-        sha256sum * > checksums-all.txt
+          mkdir -p dist
 
-    - name: Create Release
-      uses: softprops/action-gh-release@v2
-      with:
-        tag_name: ${{ steps.tag_version.outputs.tag }}
-        name: Release ${{ steps.tag_version.outputs.tag }}
-        files: |
-          dist/go-knigavuhe-*
-          dist/checksums-*.txt
-          dist/version.txt
-        generate_release_notes: true
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          export GOFLAGS="-trimpath -mod=readonly"
+          export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
 
-    - name: Upload artifacts (manual runs)
-      if: github.event_name == 'workflow_dispatch'
-      uses: actions/upload-artifact@v4
-      with:
-        name: release-${{ steps.tag_version.outputs.version }}
-        path: dist/
-        retention-days: 7
+          GIT_COMMIT=$(git rev-parse HEAD)
+          BUILD_DATE=$(date -u -d @${SOURCE_DATE_EPOCH} +%Y-%m-%dT%H:%M:%SZ)
+          GO_VERSION=$(go version | cut -d' ' -f3)
+
+          UPDATE_BASE_URL="https://github.com/${{ github.repository }}/releases/latest/download"
+
+          BASE_LDFLAGS="-s -w -buildid= \
+            -X main.version=${{ steps.tag_version.outputs.version }} \
+            -X main.gitCommit=${GIT_COMMIT} \
+            -X main.buildDate=${BUILD_DATE} \
+            -X main.goVersion=${GO_VERSION} \
+            -X main.updateURL=${UPDATE_BASE_URL}"
+
+          targets=(
+            "linux/amd64"
+            "linux/arm64"
+            "windows/amd64"
+            "windows/arm64"
+            "darwin/amd64"
+            "darwin/arm64"
+            "android/arm64"
+          )
+
+          for target in "${targets[@]}"; do
+            GOOS=${target%/*}
+            GOARCH=${target#*/}
+
+            output="go-knigavuhe-${GOOS}-${GOARCH}"
+            [[ "$GOOS" == "windows" ]] && output+=".exe"
+
+            if [[ "$GOOS" == "windows" ]]; then
+              LDFLAGS="${BASE_LDFLAGS} -H windowsgui"
+            else
+              LDFLAGS="${BASE_LDFLAGS}"
+            fi
+
+            echo "==> Building ${output}"
+            CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH \
+              go build -ldflags="$LDFLAGS" -o "dist/${output}" .
+          done
+
+          # write version file consumed by updater
+          echo "${{ steps.tag_version.outputs.version }}" > dist/version.txt
+
+      - name: Generate build attestation and checksums (safe)
+        id: checksums
+        run: |
+          set -euo pipefail
+          cd dist
+
+          # Make shell behave well for globs
+          shopt -s nullglob
+
+          # Platform-specific arrays
+          windows=( *.exe )
+          unix=( go-knigavuhe-*-linux-* go-knigavuhe-*-darwin-* go-knigavuhe-*-android-* )
+
+          # Remove any accidental zero-byte files from previous runs (defensive)
+          find . -type f -size 0 -print -delete || true
+
+          # Windows checksums (only if any .exe present)
+          if ((${#windows[@]})); then
+            echo "Writing checksums-windows.txt for files: ${windows[*]}"
+            sha256sum "${windows[@]}" > checksums-windows.txt
+          else
+            echo "No .exe files found; skipping checksums-windows.txt"
+          fi
+
+          # Unix checksums (linux/darwin/android)
+          # Expand unix array carefully: each pattern may expand to multiple files
+          unix_files=()
+          for pat in "${unix[@]}"; do
+            for f in $pat; do
+              unix_files+=("$f")
+            done
+          done
+
+          if ((${#unix_files[@]})); then
+            echo "Writing checksums-unix.txt"
+            sha256sum "${unix_files[@]}" > checksums-unix.txt
+          else
+            echo "No unix-target files found; skipping checksums-unix.txt"
+          fi
+
+          # checksums-all: include all non-empty files (explicitly include version.txt)
+          all_files=( go-knigavuhe-* version.txt )
+          # Filter for files that actually exist and are non-empty
+          real_all=()
+          for f in "${all_files[@]}"; do
+            if [ -f "$f" ] && [ -s "$f" ]; then
+              real_all+=("$f")
+            fi
+          done
+
+          if ((${#real_all[@]})); then
+            sha256sum "${real_all[@]}" > checksums-all.txt
+          else
+            echo "ERROR: no artifacts found to produce checksums-all.txt" >&2
+            exit 1
+          fi
+
+          # Final defensive check - list dist contents and sizes
+          echo "Dist contents (file : size bytes):"
+          for f in *; do
+            if [ -f "$f" ]; then
+              ls -l "$f"
+            fi
+          done
+
+      - name: Validate artifacts before release
+        id: validate_artifacts
+        run: |
+          set -euo pipefail
+          # Ensure dist exists and has at least one non-empty artifact and version.txt exists
+          if [ ! -d dist ]; then
+            echo "ERROR: dist/ missing" >&2
+            exit 1
+          fi
+
+          # Ensure version.txt exists and is non-empty
+          if [ ! -s dist/version.txt ]; then
+            echo "ERROR: dist/version.txt missing or empty" >&2
+            exit 1
+          fi
+
+          # Ensure there's at least one non-empty binary file (go-knigavuhe-*)
+          shopt -s nullglob
+          binaries=( dist/go-knigavuhe-* )
+          found=0
+          for b in "${binaries[@]}"; do
+            if [ -f "$b" ] && [ -s "$b" ]; then
+              found=1
+              break
+            fi
+          done
+
+          if [ "$found" -ne 1 ]; then
+            echo "ERROR: No built binaries found in dist/ (no non-empty 'go-knigavuhe-*' files)" >&2
+            exit 1
+          fi
+
+          echo "Validation passed: artifacts present."
+
+      - name: Prepare release file list (non-empty files only)
+        id: prepare_release_files
+        run: |
+          set -euo pipefail
+
+          # Build list of non-empty files under dist/, relative paths
+          FILES=""
+          cd dist
+          for f in *; do
+            if [ -f "$f" ] && [ -s "$f" ]; then
+              # use workspace-root prefixed path for the release action
+              FILES="${FILES}dist/$f\n"
+            fi
+          done
+
+          # If no files are present, fail loudly
+          if [ -z "$FILES" ]; then
+            echo "ERROR: No non-empty files to release. Aborting." >&2
+            exit 1
+          fi
+
+          # Emit as step output (multiline)
+          # Note: use $GITHUB_OUTPUT to set multiline output
+          echo -e "files<<EOF" >> "$GITHUB_OUTPUT"
+          echo -e "$FILES" >> "$GITHUB_OUTPUT"
+          echo -e "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag_version.outputs.tag }}
+          name: Release ${{ steps.tag_version.outputs.tag }}
+          files: ${{ steps.prepare_release_files.outputs.files }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload artifacts (manual runs)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ steps.tag_version.outputs.version }}
+          path: dist/
+          retention-days: 7

@@ -135,7 +135,7 @@ var (
 
 func main() {
 	if runtime.GOOS == "windows" {
-		os.Remove(os.Args[0] + ".old")
+		os.Remove("." + os.Args[0] + ".old")
 	}
 
 	var showVersion, waitUpdate bool

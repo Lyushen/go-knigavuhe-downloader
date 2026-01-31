@@ -413,13 +413,9 @@ func main() {
 		}
 	}
 	fmt.Println(strings.Repeat("=", 60))
-
-	// Clean up state if everything is successful
 	state.DeleteIfComplete()
 }
-
 func checkAndApplyUpdate() (bool, error) {
-
 	versionURL := strings.TrimRight(updateURL, "/") + "/version.txt"
 	req, err := http.NewRequest("GET", versionURL, nil)
 	if err != nil {
@@ -446,19 +442,18 @@ func checkAndApplyUpdate() (bool, error) {
 	if remoteVersion == "" || remoteVersion == version {
 		return false, nil
 	}
+
 	fmt.Printf("⬆️  New version found: %s (Current: %s). Updating...\n", remoteVersion, version)
 	binName := fmt.Sprintf("go-knigavuhe-%s-%s", runtime.GOOS, runtime.GOARCH)
 	if runtime.GOOS == "windows" {
 		binName += ".exe"
 	}
 	binURL := strings.TrimRight(updateURL, "/") + "/" + binName
-
 	binReq, err := http.NewRequest("GET", binURL, nil)
 	if err != nil {
 		return false, err
 	}
 	binReq.Header.Set("User-Agent", userAgent)
-
 	binResp, err := httpClient.Do(binReq)
 	if err != nil {
 		return false, err
@@ -468,7 +463,6 @@ func checkAndApplyUpdate() (bool, error) {
 	if binResp.StatusCode != http.StatusOK {
 		return false, fmt.Errorf("binary download HTTP %d from %s", binResp.StatusCode, binURL)
 	}
-
 	err = selfupdate.Apply(binResp.Body, selfupdate.Options{})
 	if err != nil {
 		return false, fmt.Errorf("failed to apply update: %w", err)
@@ -476,7 +470,6 @@ func checkAndApplyUpdate() (bool, error) {
 
 	return true, nil
 }
-
 func fileExists(filename string) bool {
 	_, err := os.Stat(filename)
 	return err == nil

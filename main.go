@@ -34,6 +34,13 @@ var (
 	updateURL = ""
 )
 
+// Global flags
+var (
+	verboseMode      bool
+	bookConcurrency  int
+	trackConcurrency int
+)
+
 type Person struct {
 	Name string `json:"name"`
 }
@@ -63,6 +70,58 @@ type BookInfo struct {
 	URL         string
 	DisplayName string
 	SeriesIndex string
+}
+
+// State tracking structures
+type BookStatus string
+
+const (
+	StatusPending     BookStatus = "pending"
+	StatusDownloading BookStatus = "downloading"
+	StatusCompleted   BookStatus = "completed"
+	StatusFailed      BookStatus = "failed"
+)
+
+type DownloadState struct {
+	Books map[string]BookStatus `json:"books"`
+	mu    sync.Mutex            `json:"-"`
+	path  string                `json:"-"`
+}
+
+func (s *DownloadState) UpdateStatus(bookName string, status BookStatus) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Books[bookName] = status
+	s.save()
+}
+
+func (s *DownloadState) GetStatus(bookName string) BookStatus {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Books[bookName]
+}
+
+func (s *DownloadState) save() {
+	data, err := json.MarshalIndent(s, "", "  ")
+	if err == nil {
+		os.WriteFile(s.path, data, 0644)
+	}
+}
+
+func (s *DownloadState) DeleteIfComplete() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	allComplete := true
+	for _, status := range s.Books {
+		if status != StatusCompleted {
+			allComplete = false
+			break
+		}
+	}
+	if allComplete {
+		os.Remove(s.path)
+		fmt.Println("✅ All downloads completed successfully. State file cleaned up.")
+	}
 }
 
 const (
@@ -120,7 +179,6 @@ var (
 		},
 	}
 )
-var verboseMode bool
 
 func debugLog(format string, v ...interface{}) {
 	if verboseMode {
@@ -186,6 +244,8 @@ func main() {
 	flag.BoolVar(&verboseMode, "verbose", false, "Show detailed technical logs")
 	flag.BoolVar(&showVersion, "version", false, "Print version information and exit")
 	flag.BoolVar(&waitUpdate, "wait-update", false, "Wait for a new version to be available, update, and then exit")
+	flag.IntVar(&bookConcurrency, "book-workers", 1, "Number of books to download in parallel (default: 1 for sequential)")
+	flag.IntVar(&trackConcurrency, "track-workers", 5, "Number of tracks to download in parallel per book (default: 5)")
 	flag.Parse()
 
 	if showVersion {
@@ -234,12 +294,13 @@ func main() {
 	if len(args) < 2 {
 		fmt.Println("Usage:")
 		fmt.Println("  Flags:")
-		fmt.Println("    -wait-update : Loop and wait for update before exiting")
-		fmt.Println("    -version     : Show version info")
-		fmt.Println("    -verbose     : Show detailed output")
-		fmt.Println("  For series: audiobook-downloader <output-dir> <series-url>")
-		fmt.Println("  For file:   audiobook-downloader <output-dir> <url-file.txt>")
-		fmt.Println("  <output-dir>   : Directory to save audiobooks")
+		fmt.Println("    -book-workers  : Book concurrency (default: 1)")
+		fmt.Println("    -track-workers : Track concurrency per book (default: 5)")
+		fmt.Println("    -wait-update   : Loop and wait for update before exiting")
+		fmt.Println("    -version       : Show version info")
+		fmt.Println("    -verbose       : Show detailed output")
+		fmt.Println("  For series: audiobook-downloader [flags] <output-dir> <series-url>")
+		fmt.Println("  For file:   audiobook-downloader [flags] <output-dir> <url-file.txt>")
 		os.Exit(1)
 	}
 
@@ -248,6 +309,19 @@ func main() {
 
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
 		log.Fatalf("Error creating output directory: %v", err)
+	}
+
+	// Initialize State
+	statePath := filepath.Join(outputDir, "state.json")
+	state := &DownloadState{
+		Books: make(map[string]BookStatus),
+		path:  statePath,
+	}
+
+	// Load existing state if available
+	if stateData, err := os.ReadFile(statePath); err == nil {
+		json.Unmarshal(stateData, state)
+		fmt.Println("🔄 Resuming from previous state...")
 	}
 
 	var results []DownloadResult
@@ -290,7 +364,7 @@ func main() {
 		}
 
 		fmt.Printf("🚀 Processing %d total books\n", len(allBooks))
-		results = processDownloads(outputDir, allBooks)
+		results = processDownloads(outputDir, allBooks, state)
 	} else {
 
 		fmt.Printf("🔍 Extracting books from series: %s\n", inputArg)
@@ -304,7 +378,7 @@ func main() {
 		}
 
 		fmt.Printf("✅ Found %d books\n", len(books))
-		results = processDownloads(outputDir, books)
+		results = processDownloads(outputDir, books, state)
 	}
 
 	fmt.Println("\n" + strings.Repeat("=", 60))
@@ -321,6 +395,9 @@ func main() {
 		}
 	}
 	fmt.Println(strings.Repeat("=", 60))
+
+	// Clean up state if everything is successful
+	state.DeleteIfComplete()
 }
 
 func checkAndApplyUpdate() (bool, error) {
@@ -440,31 +517,22 @@ func extractBooksFromSeries(seriesURL string) ([]BookInfo, error) {
 		fmt.Printf("Debug: Found %d raw book items\n", len(matches))
 	}
 
-	for i, match := range matches {
+	for _, match := range matches {
 		content := match[1]
 
 		urlMatch := bookURLRegex.FindStringSubmatch(content)
 		if len(urlMatch) < 2 {
-			if os.Getenv("DEBUG") == "1" {
-				fmt.Printf("Debug: Item %d - No URL match\n", i+1)
-			}
 			continue
 		}
 
 		indexMatch := bookIndexRegex.FindStringSubmatch(content)
 		if len(indexMatch) < 2 {
-			if os.Getenv("DEBUG") == "1" {
-				fmt.Printf("Debug: Item %d - No index match\n", i+1)
-			}
 			continue
 		}
 		index := strings.TrimSpace(indexMatch[1])
 
 		titleMatch := bookTitleRegex.FindStringSubmatch(content)
 		if len(titleMatch) < 2 {
-			if os.Getenv("DEBUG") == "1" {
-				fmt.Printf("Debug: Item %d - No title match\n", i+1)
-			}
 			continue
 		}
 		title := strings.TrimSpace(titleMatch[1])
@@ -500,18 +568,37 @@ func compareIndices(a, b string) bool {
 	return len(partsA) < len(partsB)
 }
 
-func processDownloads(outputDir string, books []BookInfo) []DownloadResult {
+func processDownloads(outputDir string, books []BookInfo, state *DownloadState) []DownloadResult {
 	var wg sync.WaitGroup
 	bookChan := make(chan BookInfo, len(books))
 	resultChan := make(chan DownloadResult, len(books))
 
-	workers := runtime.NumCPU() * 2
+	// Control book concurrency with flag (Default: 1 - sequential)
+	workers := bookConcurrency
+	if workers < 1 {
+		workers = 1
+	}
+
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for book := range bookChan {
+				// Skip if already completed from a previous run
+				if state.GetStatus(book.DisplayName) == StatusCompleted {
+					fmt.Printf("⏭️  Skipping %s (Already completed)\n", book.DisplayName)
+					resultChan <- DownloadResult{URL: book.URL, BookName: book.DisplayName, Path: filepath.Join(outputDir, sanitizePath(book.DisplayName))}
+					continue
+				}
+
+				state.UpdateStatus(book.DisplayName, StatusDownloading)
 				result := downloadBook(book.URL, outputDir, book.DisplayName)
+
+				if len(result.Errors) == 0 {
+					state.UpdateStatus(book.DisplayName, StatusCompleted)
+				} else {
+					state.UpdateStatus(book.DisplayName, StatusFailed)
+				}
 				resultChan <- result
 			}
 		}()
@@ -519,6 +606,10 @@ func processDownloads(outputDir string, books []BookInfo) []DownloadResult {
 
 	for i, book := range books {
 		fmt.Printf("📝 Queuing %d/%d: %s\n", i+1, len(books), book.DisplayName)
+		// Mark as pending if not already tracked
+		if state.GetStatus(book.DisplayName) == "" {
+			state.UpdateStatus(book.DisplayName, StatusPending)
+		}
 		bookChan <- book
 	}
 	close(bookChan)
@@ -565,6 +656,7 @@ func downloadBook(bookURL, outputDir, displayName string) DownloadResult {
 		return result
 	}
 
+	// ENSURE FOLDER EXISTS
 	bookDir := filepath.Join(outputDir, sanitizePath(displayName))
 	if err := os.MkdirAll(bookDir, 0755); err != nil {
 		result.addError("create directory", err)
@@ -657,7 +749,6 @@ func extractDescription(html string) (string, error) {
 }
 
 func sanitizePath(path string) string {
-	// 1. Replace forbidden filesystem characters (<>:"/\|?*) with "_"
 	safe := forbiddenChars.ReplaceAllString(path, "_")
 
 	whitespace := regexp.MustCompile(`\s+`)
@@ -678,7 +769,6 @@ func sanitizePath(path string) string {
 		}
 	}
 
-	// 6. Ensure the filename isn't empty after sanitization
 	if safe == "" {
 		safe = "audiobook_file"
 	}
@@ -758,21 +848,15 @@ func downloadPlaylist(bookDir string, bookData *BookData, result *DownloadResult
 	debugLog(" > Standard Tracks: %d", len(bookData.Playlist))
 	debugLog(" > Merged Tracks:   %d", len(bookData.MergedPlaylist))
 
-	if len(bookData.Playlist) > 0 {
-		debugLog(" > Sample Track URL: %s", bookData.Playlist[0].URL)
-	}
-
 	err := downloadTracks(bookDir, bookData.Playlist, "STANDARD")
 	if err == nil {
 		return nil
 	}
 
 	debugLog("🔴 Standard Playlist Failed: %v", err)
-
 	fmt.Printf("   ⚠️  Standard download failed, trying merged file...\n")
 
 	if err := downloadTracks(bookDir, bookData.MergedPlaylist, "MERGED"); err != nil {
-
 		result.addError("playlist download", fmt.Errorf("ALL methods failed. Merged error: %v", err))
 		return err
 	}
@@ -790,7 +874,13 @@ func downloadTracks(bookDir string, tracks []Audio, sourceType string) error {
 
 	var wg sync.WaitGroup
 	errChan := make(chan error, 1)
-	sem := make(chan struct{}, 5)
+
+	// Use trackConcurrency flag (Default: 5). If set to 1, loads strictly track by track.
+	workers := trackConcurrency
+	if workers < 1 {
+		workers = 1
+	}
+	sem := make(chan struct{}, workers)
 
 	for i, track := range tracks {
 		select {
@@ -819,18 +909,23 @@ func downloadTracks(bookDir string, tracks []Audio, sourceType string) error {
 
 			filePath := filepath.Join(bookDir, sanitizePath(t.Title)+ext)
 
+			// If file already exists, it is done.
 			if _, err := os.Stat(filePath); err == nil {
 				return
 			}
 
+			// Clean up orphan .part files from previous runs
+			partFile := filePath + ".part"
+			os.Remove(partFile)
+
 			var lastErr error
 			for attempt := 1; attempt <= maxRetries; attempt++ {
 
+				// Use robust download (saves to .part first)
 				if err := downloadFileVerbose(t.URL, filePath); err == nil {
 					return
 				} else {
 					lastErr = err
-
 					if idx == 0 {
 						debugLog("[%s] Track 1 Retry %d/%d failed: %v", sourceType, attempt, maxRetries, err)
 					}
@@ -857,14 +952,16 @@ func downloadTracks(bookDir string, tracks []Audio, sourceType string) error {
 	return nil
 }
 
-func downloadFileVerbose(url, filePath string) error {
+// downloadFileVerbose downloads safely to a .part file to prevent corruptions if a VM thread is killed.
+func downloadFileVerbose(url, finalFilePath string) error {
+	partFilePath := finalFilePath + ".part"
+
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return fmt.Errorf("req build error: %w", err)
 	}
 
 	req.Header.Set("User-Agent", userAgent)
-
 	req.Header.Set("Referer", "https://knigavuhe.org/")
 
 	resp, err := httpClient.Do(req)
@@ -874,7 +971,6 @@ func downloadFileVerbose(url, filePath string) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-
 		return fmt.Errorf("HTTP %d (%s)", resp.StatusCode, http.StatusText(resp.StatusCode))
 	}
 
@@ -882,20 +978,28 @@ func downloadFileVerbose(url, filePath string) error {
 		return fmt.Errorf("HTTP body is empty (Content-Length: 0)")
 	}
 
-	file, err := os.Create(filePath)
+	// Write to .part file
+	file, err := os.Create(partFilePath)
 	if err != nil {
 		return fmt.Errorf("file create error: %w", err)
 	}
-	defer file.Close()
 
 	n, err := io.Copy(file, resp.Body)
+	file.Close() // Close immediately after copy so we can rename
+
 	if err != nil {
+		os.Remove(partFilePath)
 		return fmt.Errorf("io.Copy error: %w", err)
 	}
 
 	if n == 0 {
-		os.Remove(filePath)
+		os.Remove(partFilePath)
 		return fmt.Errorf("wrote 0 bytes")
+	}
+
+	// Success! Rename .part to .mp3
+	if err := os.Rename(partFilePath, finalFilePath); err != nil {
+		return fmt.Errorf("failed to rename part file: %w", err)
 	}
 
 	return nil

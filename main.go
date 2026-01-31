@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -21,29 +20,17 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/minio/selfupdate"
 )
 
 var (
-	version   = "0.0.0"
-	gitCommit = ""
-	buildDate = ""
-	goVersion = ""
-	updateURL = ""
+	version, gitCommit, buildDate, goVersion, updateURL string
+	verboseMode                                         bool
+	bookConcurrency, trackConcurrency                   int
 )
-
-// Global flags
-var (
-	verboseMode      bool
-	bookConcurrency  int
-	trackConcurrency int
-)
-
-type Person struct {
-	Name string `json:"name"`
-}
 
 type Book struct {
 	Name    string      `json:"name"`
@@ -67,12 +54,10 @@ type BookData struct {
 }
 
 type BookInfo struct {
-	URL         string
-	DisplayName string
-	SeriesIndex string
+	URL, DisplayName, SeriesIndex string
 }
 
-// State tracking structures
+// --- State & Globals ---
 type BookStatus string
 
 const (
@@ -88,819 +73,458 @@ type DownloadState struct {
 	path  string                `json:"-"`
 }
 
-func (s *DownloadState) UpdateStatus(bookName string, status BookStatus) {
+func (s *DownloadState) UpdateStatus(book string, status BookStatus) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.Books[bookName] = status
-	s.save()
+	s.Books[book] = status
+	data, _ := json.MarshalIndent(s, "", "  ")
+	os.WriteFile(s.path, data, 0644)
 }
 
-func (s *DownloadState) GetStatus(bookName string) BookStatus {
+func (s *DownloadState) GetStatus(book string) BookStatus {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.Books[bookName]
-}
-
-func (s *DownloadState) save() {
-	data, err := json.MarshalIndent(s, "", "  ")
-	if err == nil {
-		os.WriteFile(s.path, data, 0644)
-	}
-}
-
-func (s *DownloadState) DeleteIfComplete() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	allComplete := true
-	for _, status := range s.Books {
-		if status != StatusCompleted {
-			allComplete = false
-			break
-		}
-	}
-	if allComplete {
-		os.Remove(s.path)
-		fmt.Println("✅ All downloads completed successfully. State file cleaned up.")
-	}
+	return s.Books[book]
 }
 
 const (
-	userAgent    = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36 Edg/135.0.0.0"
-	cookie       = "new_design=1"
-	maxRetries   = 20
-	retryDelay   = 2 * time.Second
-	maxIdleConns = 10
+	userAgent  = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36 Edg/135.0.0.0"
+	maxRetries = 20
+	retryDelay = 2 * time.Second
 )
 
 var (
-	jsonRegex      = regexp.MustCompile(`BookController\.enter\((.*?)\);`)
-	descRegex      = regexp.MustCompile(`bookDescription\">(.+?)</div>`)
-	forbiddenChars = regexp.MustCompile(`[<>:"/\\|?*]`)
-
-	bookItemRegex  = regexp.MustCompile(`(?s)<div class="bookitem">(.*?)</div>\s*</div>`)
-	bookURLRegex   = regexp.MustCompile(`(?s)class="bookitem_cover"\s+href="/(book/[^"]+)"`)
-	bookIndexRegex = regexp.MustCompile(`(?s)<span class="bookitem_serie_index">\s*([\d\.]+)\.\s*</span>`)
-	bookTitleRegex = regexp.MustCompile(`(?s)<span class="bookitem_serie_index">\s*[\d\.]+\.\s*</span>\s*([^<]+)`)
-
-	customDialer = &net.Dialer{
-		Timeout:   30 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}
+	jsonRegex        = regexp.MustCompile(`BookController\.enter\((.*?)\);`)
+	descRegex        = regexp.MustCompile(`bookDescription\">(.+?)</div>`)
+	forbiddenChars   = regexp.MustCompile(`[<>:"/\\|?*]`)
+	bookItemRegex    = regexp.MustCompile(`(?s)<div class="bookitem">(.*?)</div>\s*</div>`)
+	bookURLRegex     = regexp.MustCompile(`(?s)class="bookitem_cover"\s+href="/(book/[^"]+)"`)
+	bookIndexRegex   = regexp.MustCompile(`(?s)<span class="bookitem_serie_index">\s*([\d\.]+)\.\s*</span>`)
+	bookTitleRegex   = regexp.MustCompile(`(?s)<span class="bookitem_serie_index">\s*[\d\.]+\.\s*</span>\s*([^<]+)`)
+	singleIndexRegex = regexp.MustCompile(`class="book_info_line_serie_index">\(([\d\.]+)\)`)
+	singleTitleRegex = regexp.MustCompile(`<h2 class="book_title"[^>]*>(.*?)</h2>`)
 
 	httpClient = &http.Client{
 		Timeout: 30 * time.Second,
 		Transport: &http.Transport{
-			MaxIdleConns:    maxIdleConns,
-			IdleConnTimeout: 60 * time.Second,
-
+			MaxIdleConns: 10,
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				host, port, err := net.SplitHostPort(addr)
-				if err != nil {
-					return nil, err
-				}
-
+				host, port, _ := net.SplitHostPort(addr)
 				if net.ParseIP(host) != nil {
-					return customDialer.DialContext(ctx, network, addr)
+					return (&net.Dialer{Timeout: 30 * time.Second}).DialContext(ctx, network, addr)
 				}
-
-				ips, err := lookupIPWithFallback(ctx, host)
-				if err != nil {
-					return nil, err
+				resolvers := []*net.Resolver{
+					net.DefaultResolver,
+					{PreferGo: true, Dial: func(ctx context.Context, n, a string) (net.Conn, error) { return net.Dial("udp", "8.8.8.8:53") }},
+					{PreferGo: true, Dial: func(ctx context.Context, n, a string) (net.Conn, error) { return net.Dial("udp", "1.1.1.1:53") }},
 				}
-
-				firstIP := ips[0]
-
-				if strings.Contains(firstIP, ":") {
-					firstIP = "[" + firstIP + "]"
+				for _, r := range resolvers {
+					if ips, err := r.LookupHost(ctx, host); err == nil && len(ips) > 0 {
+						target := ips[0]
+						if strings.Contains(target, ":") {
+							target = "[" + target + "]"
+						}
+						return (&net.Dialer{Timeout: 30 * time.Second}).DialContext(ctx, network, target+":"+port)
+					}
 				}
-
-				return customDialer.DialContext(ctx, network, firstIP+":"+port)
+				return nil, fmt.Errorf("DNS resolution failed for %s", host)
 			},
 		},
 	}
 )
 
-func debugLog(format string, v ...interface{}) {
-	if verboseMode {
-		log.Printf("[DEBUG] "+format, v...)
-	}
-}
-
-func lookupIPWithFallback(ctx context.Context, host string) ([]string, error) {
-
-	dnsProviders := []struct {
-		name     string
-		resolver *net.Resolver
-	}{
-		{
-			name:     "System",
-			resolver: net.DefaultResolver,
-		},
-		{
-			name: "Google (8.8.8.8)",
-			resolver: &net.Resolver{
-				PreferGo: true,
-				Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-					d := net.Dialer{Timeout: 2 * time.Second}
-					return d.DialContext(ctx, "udp", "8.8.8.8:53")
-				},
-			},
-		},
-		{
-			name: "Cloudflare (1.1.1.1)",
-			resolver: &net.Resolver{
-				PreferGo: true,
-				Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-					d := net.Dialer{Timeout: 2 * time.Second}
-					return d.DialContext(ctx, "udp", "1.1.1.1:53")
-				},
-			},
-		},
-	}
-
-	var lastErr error
-
-	for _, provider := range dnsProviders {
-
-		ips, err := provider.resolver.LookupHost(ctx, host)
-		if err == nil && len(ips) > 0 {
-			if verboseMode && provider.name != "System" {
-
-				fmt.Printf("DEBUG: Resolved %s using %s\n", host, provider.name)
-			}
-			return ips, nil
-		}
-		lastErr = err
-	}
-
-	return nil, fmt.Errorf("all DNS resolvers failed: %v", lastErr)
-}
-
-// Windows Fix: Clean up .old files from previous updates
-func cleanupOldBinary() {
-	if runtime.GOOS == "windows" {
-		exe, err := os.Executable()
-		if err == nil {
-			oldExe := exe + ".old"
-			if _, err := os.Stat(oldExe); err == nil {
-				// Attempt to remove the old file. If it fails, we can't do much,
-				// but usually, the process is dead by now.
-				_ = os.Remove(oldExe)
-			}
-		}
-	}
-}
-
 func main() {
-	// Attempt to clean up artifacts from previous updates immediately
-	cleanupOldBinary()
+	if runtime.GOOS == "windows" {
+		os.Remove(os.Args[0] + ".old")
+	}
 
-	var showVersion bool
-	var waitUpdate bool
-
+	var showVersion, waitUpdate bool
 	flag.BoolVar(&verboseMode, "verbose", false, "Show detailed technical logs")
-	flag.BoolVar(&showVersion, "version", false, "Print version information and exit")
-	flag.BoolVar(&waitUpdate, "wait-update", false, "Wait for a new version to be available, update, and then exit")
-	flag.IntVar(&bookConcurrency, "book-workers", 1, "Number of books to download in parallel (default: 1 for sequential)")
-	flag.IntVar(&trackConcurrency, "track-workers", 5, "Number of tracks to download in parallel per book (default: 5)")
+	flag.BoolVar(&showVersion, "version", false, "Print version")
+	flag.BoolVar(&waitUpdate, "wait-update", false, "Wait for update")
+	flag.IntVar(&bookConcurrency, "book-workers", 1, "Book concurrency")
+	flag.IntVar(&trackConcurrency, "track-workers", 5, "Track concurrency")
 	flag.Parse()
 
 	if showVersion {
-		fmt.Printf("Go Knigavuhe Downloader\n")
-		fmt.Printf("Version:    %s\n", version)
-		fmt.Printf("Git Commit: %s\n", gitCommit)
-		fmt.Printf("Build Date: %s\n", buildDate)
-		fmt.Printf("Go Version: %s\n", goVersion)
-		if updateURL != "" {
-			fmt.Printf("Update URL: %s\n", updateURL)
-		}
+		fmt.Printf("Ver: %s, Commit: %s, Date: %s, Go: %s\n", version, gitCommit, buildDate, goVersion)
 		os.Exit(0)
 	}
 
 	if updateURL != "" {
-		if waitUpdate {
-			fmt.Printf("⏳ Waiting for update from %s...\n", updateURL)
-			for {
-				updated, err := checkAndApplyUpdate()
-				fmt.Printf(".")
-				if err != nil {
-					// Print detailed error so user knows why it failed
-					fmt.Printf("\n❌ Update Failed: %v\n", err)
-				} else if updated {
-					fmt.Println("\n✅ Update applied successfully. Exiting to restart.")
-					os.Exit(0)
-				}
-				time.Sleep(5 * time.Second)
-			}
-		} else {
-
+		for {
 			updated, err := checkAndApplyUpdate()
-			if err != nil {
-				if verboseMode {
-					fmt.Printf("⚠️ Update check failed: %v\n", err)
-				}
-			} else if updated {
-				fmt.Println("✅ Application updated. Exiting to restart.")
+			if updated {
+				fmt.Println("✅ Updated. Restarting.")
 				os.Exit(0)
 			}
+			if err != nil && verboseMode {
+				fmt.Printf("Update check error: %v\n", err)
+			}
+			if !waitUpdate {
+				break
+			}
+			time.Sleep(5 * time.Second)
 		}
 	} else if waitUpdate {
-		log.Fatal("❌ Cannot wait for update: No update URL injected at build time.")
+		log.Fatal("❌ No update URL injected.")
 	}
 
 	args := flag.Args()
 	if len(args) < 2 {
-		fmt.Println("Usage:")
-		fmt.Println("  Flags:")
-		fmt.Println("    -book-workers  : Book concurrency (default: 1)")
-		fmt.Println("    -track-workers : Track concurrency per book (default: 5)")
-		fmt.Println("    -wait-update   : Loop and wait for update before exiting")
-		fmt.Println("    -version       : Show version info")
-		fmt.Println("    -verbose       : Show detailed output")
-		fmt.Println("  For series: go-knigavuhe [flags] <output-dir> <series-url>")
-		fmt.Println("  For file:   go-knigavuhe [flags] <output-dir> <url-file.txt>")
+		fmt.Println("Usage: go-knigavuhe [flags] <output-dir> <url-or-file>")
 		os.Exit(1)
 	}
+	outputDir, inputArg := args[0], args[1]
+	os.MkdirAll(outputDir, 0755)
 
-	outputDir := args[0]
-	inputArg := args[1]
-
-	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		log.Fatalf("Error creating output directory: %v", err)
-	}
-
-	// Initialize State
 	statePath := filepath.Join(outputDir, "state.json")
-	state := &DownloadState{
-		Books: make(map[string]BookStatus),
-		path:  statePath,
-	}
-
-	// Load existing state if available
-	if stateData, err := os.ReadFile(statePath); err == nil {
-		json.Unmarshal(stateData, state)
-		fmt.Println("🔄 Resuming from previous state...")
-	}
-
-	var results []DownloadResult
-
-	if strings.HasSuffix(strings.ToLower(inputArg), ".txt") || fileExists(inputArg) {
-		fmt.Printf("📄 Reading URLs from file: %s\n", inputArg)
-		lines, err := readLinesFromFile(inputArg)
-		if err != nil {
-			log.Fatalf("Error reading file: %v", err)
-		}
-
-		var allBooks []BookInfo
-		for _, line := range lines {
-			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
-			}
-
-			if strings.Contains(line, "/serie/") {
-				fmt.Printf("🔍 Extracting books from series: %s\n", line)
-				books, err := extractBooksFromSeries(line)
-				if err != nil {
-					fmt.Printf("⚠️ Error extracting series %s: %v\n", line, err)
-					continue
-				}
-				allBooks = append(allBooks, books...)
-				fmt.Printf("✅ Found %d books\n", len(books))
-			} else {
-
-				allBooks = append(allBooks, BookInfo{
-					URL:         line,
-					DisplayName: extractBookNameFromURL(line),
-					SeriesIndex: fmt.Sprintf("%d", len(allBooks)+1),
-				})
-			}
-		}
-
-		if len(allBooks) == 0 {
-			log.Fatal("❌ No valid URLs or series found in file")
-		}
-
-		fmt.Printf("🚀 Processing %d total books\n", len(allBooks))
-		results = processDownloads(outputDir, allBooks, state)
-	} else {
-
-		fmt.Printf("🔍 Extracting books from series: %s\n", inputArg)
-		books, err := extractBooksFromSeries(inputArg)
-		if err != nil {
-			log.Fatalf("Error extracting books from series: %v", err)
-		}
-
-		if len(books) == 0 {
-			log.Fatal("❌ No books found in series. Run with DEBUG=1 for more info.")
-		}
-
-		fmt.Printf("✅ Found %d books\n", len(books))
-		results = processDownloads(outputDir, books, state)
-	}
-
-	fmt.Println("\n" + strings.Repeat("=", 60))
-	fmt.Println("📊 DOWNLOAD SUMMARY")
-	fmt.Println(strings.Repeat("=", 60))
-	for _, res := range results {
-		if len(res.Errors) == 0 {
-			fmt.Printf("✅ %s\n   📁 %s\n", res.BookName, res.Path)
-		} else {
-			fmt.Printf("❌ %s\n   🚨 Errors:\n", res.BookName)
-			for _, e := range res.Errors {
-				fmt.Printf("      • %s\n", e)
-			}
-		}
-	}
-	fmt.Println(strings.Repeat("=", 60))
-	state.DeleteIfComplete()
-}
-func checkAndApplyUpdate() (bool, error) {
-	versionURL := strings.TrimRight(updateURL, "/") + "/version.txt"
-	req, err := http.NewRequest("GET", versionURL, nil)
-	if err != nil {
-		return false, err
-	}
-	req.Header.Set("User-Agent", userAgent)
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return false, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return false, fmt.Errorf("version check HTTP %d", resp.StatusCode)
-	}
-
-	remoteVersionBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return false, err
-	}
-	remoteVersion := string(bytes.TrimSpace(remoteVersionBytes))
-
-	if remoteVersion == "" || remoteVersion == version {
-		return false, nil
-	}
-
-	fmt.Printf("⬆️  New version found: %s (Current: %s). Updating...\n", remoteVersion, version)
-	binName := fmt.Sprintf("go-knigavuhe-%s-%s", runtime.GOOS, runtime.GOARCH)
-	if runtime.GOOS == "windows" {
-		binName += ".exe"
-	}
-	binURL := strings.TrimRight(updateURL, "/") + "/" + binName
-	binReq, err := http.NewRequest("GET", binURL, nil)
-	if err != nil {
-		return false, err
-	}
-	binReq.Header.Set("User-Agent", userAgent)
-	binResp, err := httpClient.Do(binReq)
-	if err != nil {
-		return false, err
-	}
-	defer binResp.Body.Close()
-
-	if binResp.StatusCode != http.StatusOK {
-		return false, fmt.Errorf("binary download HTTP %d from %s", binResp.StatusCode, binURL)
-	}
-	err = selfupdate.Apply(binResp.Body, selfupdate.Options{})
-	if err != nil {
-		return false, fmt.Errorf("failed to apply update: %w", err)
-	}
-
-	return true, nil
-}
-func fileExists(filename string) bool {
-	_, err := os.Stat(filename)
-	return err == nil
-}
-
-func readLinesFromFile(filename string) ([]string, error) {
-	file, err := os.Open(filename)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	var lines []string
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		if line := strings.TrimSpace(scanner.Text()); line != "" {
-			lines = append(lines, line)
-		}
-	}
-	return lines, scanner.Err()
-}
-
-func extractBookNameFromURL(bookURL string) string {
-	parts := strings.Split(bookURL, "/")
-	if len(parts) > 0 {
-		lastPart := parts[len(parts)-1]
-		lastPart = strings.TrimSuffix(lastPart, "/")
-
-		if idx := strings.Index(lastPart, "-"); idx > 0 {
-			lastPart = lastPart[idx+1:]
-		}
-		return strings.ReplaceAll(lastPart, "-", " ")
-	}
-	return "Unknown Book"
-}
-
-func extractBooksFromSeries(seriesURL string) ([]BookInfo, error) {
-	html, err := downloadPage(seriesURL)
-	if err != nil {
-		return nil, fmt.Errorf("failed to download series page: %w", err)
-	}
-
-	if os.Getenv("DEBUG") == "1" {
-		debugFile := "debug_series.html"
-		os.WriteFile(debugFile, []byte(html), 0644)
-		fmt.Printf("Debug: Saved HTML to %s\n", debugFile)
+	state := &DownloadState{Books: make(map[string]BookStatus), path: statePath}
+	if data, err := os.ReadFile(statePath); err == nil {
+		json.Unmarshal(data, state)
 	}
 
 	var books []BookInfo
-	matches := bookItemRegex.FindAllStringSubmatch(html, -1)
-
-	if os.Getenv("DEBUG") == "1" {
-		fmt.Printf("Debug: Found %d raw book items\n", len(matches))
+	if strings.HasSuffix(inputArg, ".txt") || isFile(inputArg) {
+		lines, _ := readLines(inputArg)
+		for _, line := range lines {
+			if strings.Contains(line, "/serie/") {
+				if b, err := extractBooksFromSeries(line); err == nil {
+					books = append(books, b...)
+				}
+			} else {
+				books = append(books, BookInfo{URL: line, DisplayName: "Unknown", SeriesIndex: ""})
+			}
+		}
+	} else if strings.Contains(inputArg, "/serie/") {
+		if b, err := extractBooksFromSeries(inputArg); err == nil {
+			books = append(books, b...)
+		}
+	} else {
+		books = append(books, BookInfo{URL: inputArg, DisplayName: "Unknown", SeriesIndex: ""})
 	}
 
-	for _, match := range matches {
-		content := match[1]
-
-		urlMatch := bookURLRegex.FindStringSubmatch(content)
-		if len(urlMatch) < 2 {
-			continue
-		}
-
-		indexMatch := bookIndexRegex.FindStringSubmatch(content)
-		if len(indexMatch) < 2 {
-			continue
-		}
-		index := strings.TrimSpace(indexMatch[1])
-
-		titleMatch := bookTitleRegex.FindStringSubmatch(content)
-		if len(titleMatch) < 2 {
-			continue
-		}
-		title := strings.TrimSpace(titleMatch[1])
-
-		displayName := fmt.Sprintf("%s_%s", index, title)
-		books = append(books, BookInfo{
-			URL:         "https://knigavuhe.org/" + urlMatch[1],
-			DisplayName: displayName,
-			SeriesIndex: index,
-		})
+	if len(books) == 0 {
+		log.Fatal("❌ No books found.")
 	}
 
-	sort.Slice(books, func(i, j int) bool {
-		return compareIndices(books[i].SeriesIndex, books[j].SeriesIndex)
-	})
-
-	return books, nil
-}
-
-func compareIndices(a, b string) bool {
-	partsA := strings.Split(a, ".")
-	partsB := strings.Split(b, ".")
-
-	for i := 0; i < len(partsA) && i < len(partsB); i++ {
-		numA, _ := strconv.Atoi(partsA[i])
-		numB, _ := strconv.Atoi(partsB[i])
-
-		if numA != numB {
-			return numA < numB
-		}
-	}
-
-	return len(partsA) < len(partsB)
-}
-
-func processDownloads(outputDir string, books []BookInfo, state *DownloadState) []DownloadResult {
 	var wg sync.WaitGroup
 	bookChan := make(chan BookInfo, len(books))
-	resultChan := make(chan DownloadResult, len(books))
-
-	// Control book concurrency with flag (Default: 1 - sequential)
 	workers := bookConcurrency
 	if workers < 1 {
 		workers = 1
 	}
+
+	fmt.Printf("🚀 Starting processing for %d books...\n", len(books))
 
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for book := range bookChan {
-				// Skip if already completed from a previous run
-				if state.GetStatus(book.DisplayName) == StatusCompleted {
-					fmt.Printf("⏭️  Skipping %s (Already completed)\n", book.DisplayName)
-					resultChan <- DownloadResult{URL: book.URL, BookName: book.DisplayName, Path: filepath.Join(outputDir, sanitizePath(book.DisplayName))}
+				if book.DisplayName != "Unknown" && state.GetStatus(book.DisplayName) == StatusCompleted {
+					fmt.Printf("⏭️  Skipping %s\n", book.DisplayName)
 					continue
 				}
 
-				state.UpdateStatus(book.DisplayName, StatusDownloading)
-				result := downloadBook(book.URL, outputDir, book.DisplayName)
+				res := downloadBook(book.URL, outputDir, book.DisplayName, state)
 
-				if len(result.Errors) == 0 {
-					state.UpdateStatus(book.DisplayName, StatusCompleted)
+				status := StatusCompleted
+				if len(res.Errors) > 0 {
+					status = StatusFailed
+					// Force newline if progress bar was active
+					if bookConcurrency == 1 {
+						fmt.Println()
+					}
+					fmt.Printf("❌ %s failed: %v\n", res.BookName, res.Errors)
 				} else {
-					state.UpdateStatus(book.DisplayName, StatusFailed)
+					if bookConcurrency == 1 {
+						fmt.Println()
+					} // Newline after progress bar
+					// Just mark completion, downloadBook handles the "Finished" log
 				}
-				resultChan <- result
+				state.UpdateStatus(res.BookName, status)
 			}
 		}()
 	}
 
-	for i, book := range books {
-		fmt.Printf("📝 Queuing %d/%d: %s\n", i+1, len(books), book.DisplayName)
-		// Mark as pending if not already tracked
-		if state.GetStatus(book.DisplayName) == "" {
-			state.UpdateStatus(book.DisplayName, StatusPending)
-		}
+	for _, book := range books {
 		bookChan <- book
 	}
 	close(bookChan)
+	wg.Wait()
 
-	go func() {
-		wg.Wait()
-		close(resultChan)
-	}()
-
-	results := make([]DownloadResult, 0, len(books))
-	for res := range resultChan {
-		results = append(results, res)
+	allDone := true
+	for _, s := range state.Books {
+		if s != StatusCompleted {
+			allDone = false
+			break
+		}
 	}
-
-	sort.Slice(results, func(i, j int) bool {
-		idxI := extractIndex(results[i].BookName)
-		idxJ := extractIndex(results[j].BookName)
-		return compareIndices(idxI, idxJ)
-	})
-
-	return results
+	if allDone {
+		os.Remove(statePath)
+	}
 }
 
-func extractIndex(bookName string) string {
-	parts := strings.SplitN(bookName, ".", 2)
-	if len(parts) > 0 {
-		return parts[0]
-	}
-	return "999"
-}
-
-func downloadBook(bookURL, outputDir, displayName string) DownloadResult {
-	result := DownloadResult{URL: bookURL}
-
-	normalizedURL, err := normalizeURL(bookURL)
-	if err != nil {
-		result.addError("URL normalization", err)
-		return result
-	}
-
-	bookData, err := fetchBookData(normalizedURL)
-	if err != nil {
-		result.addError("fetch book data", err)
-		return result
-	}
-
-	// ENSURE FOLDER EXISTS
-	bookDir := filepath.Join(outputDir, sanitizePath(displayName))
-	if err := os.MkdirAll(bookDir, 0755); err != nil {
-		result.addError("create directory", err)
-		return result
-	}
-
-	result.BookName = displayName
-	result.Path = bookDir
-
-	downloadAssets(bookDir, bookData, &result)
-	return result
-}
-
-func fetchBookData(bookURL string) (*BookData, error) {
-	html, err := downloadPage(bookURL)
-	if err != nil {
-		return nil, fmt.Errorf("page download failed: %w", err)
-	}
-
-	jsonData, err := extractJSON(html)
-	if err != nil {
-		return nil, fmt.Errorf("JSON extraction failed: %w", err)
-	}
-
-	bookData, err := parseBookJSON(jsonData)
-	if err != nil {
-		return nil, fmt.Errorf("JSON parsing failed: %w", err)
-	}
-
-	bookData.CoverAlt = strings.Split(bookData.Book.Cover, "-")[0] + ".jpg"
-
-	if desc, err := extractDescription(html); err == nil {
-		bookData.Description = desc
-	}
-
-	return bookData, nil
-}
-
-func downloadPage(url string) (string, error) {
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return "", err
-	}
-
+func checkAndApplyUpdate() (bool, error) {
+	req, _ := http.NewRequest("GET", strings.TrimRight(updateURL, "/")+"/version.txt", nil)
 	req.Header.Set("User-Agent", userAgent)
-	req.Header.Set("Cookie", cookie)
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	remoteVer, _ := io.ReadAll(resp.Body)
+	if string(bytes.TrimSpace(remoteVer)) == version {
+		return false, nil
+	}
 
+	binName := fmt.Sprintf("go-knigavuhe-%s-%s", runtime.GOOS, runtime.GOARCH)
+	if runtime.GOOS == "windows" {
+		binName += ".exe"
+	}
+	resp, err = httpClient.Get(strings.TrimRight(updateURL, "/") + "/" + binName)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	return true, selfupdate.Apply(resp.Body, selfupdate.Options{})
+}
+
+func isFile(f string) bool { _, err := os.Stat(f); return err == nil }
+func readLines(f string) ([]string, error) {
+	file, err := os.Open(f)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	var lines []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		if t := strings.TrimSpace(scanner.Text()); t != "" {
+			lines = append(lines, t)
+		}
+	}
+	return lines, nil
+}
+
+func extractBooksFromSeries(url string) ([]BookInfo, error) {
+	html, err := downloadPage(url)
+	if err != nil {
+		return nil, err
+	}
+	var books []BookInfo
+	matches := bookItemRegex.FindAllStringSubmatch(html, -1)
+	for _, match := range matches {
+		content := match[1]
+		u := bookURLRegex.FindStringSubmatch(content)
+		idx := bookIndexRegex.FindStringSubmatch(content)
+		t := bookTitleRegex.FindStringSubmatch(content)
+		if len(u) > 1 && len(idx) > 1 && len(t) > 1 {
+			books = append(books, BookInfo{
+				URL:         "https://knigavuhe.org/" + u[1],
+				DisplayName: strings.TrimSpace(idx[1]) + "_" + strings.TrimSpace(t[1]),
+				SeriesIndex: strings.TrimSpace(idx[1]),
+			})
+		}
+	}
+	sort.Slice(books, func(i, j int) bool { return compareIndices(books[i].SeriesIndex, books[j].SeriesIndex) })
+	return books, nil
+}
+
+func compareIndices(a, b string) bool {
+	pa, pb := strings.Split(a, "."), strings.Split(b, ".")
+	for i := 0; i < len(pa) && i < len(pb); i++ {
+		na, _ := strconv.Atoi(pa[i])
+		nb, _ := strconv.Atoi(pb[i])
+		if na != nb {
+			return na < nb
+		}
+	}
+	return len(pa) < len(pb)
+}
+
+type DownloadResult struct {
+	URL, BookName, Path string
+	Errors              []string
+}
+
+func downloadBook(bookURL, outputDir, providedName string, state *DownloadState) DownloadResult {
+	res := DownloadResult{URL: bookURL}
+	u, _ := url.Parse(bookURL)
+	if u.Host == "m.knigavuhe.org" {
+		u.Host = "knigavuhe.org"
+	}
+	u.Scheme = "https"
+
+	html, err := downloadPage(u.String())
+	if err != nil {
+		res.Errors = append(res.Errors, err.Error())
+		return res
+	}
+
+	// --- Resolve Name and Index ---
+	finalName := providedName
+	idxMatch := singleIndexRegex.FindStringSubmatch(html)
+	titleMatch := singleTitleRegex.FindStringSubmatch(html)
+
+	if finalName == "Unknown" || finalName == "" {
+		if len(titleMatch) > 1 {
+			finalName = strings.TrimSpace(titleMatch[1])
+			if len(idxMatch) > 1 {
+				finalName = strings.TrimSpace(idxMatch[1]) + "_" + finalName
+			}
+		} else {
+			parts := strings.Split(strings.TrimSuffix(u.Path, "/"), "/")
+			if len(parts) > 0 {
+				finalName = parts[len(parts)-1]
+			}
+		}
+	} else if len(idxMatch) > 1 && !strings.Contains(providedName, "_") {
+		finalName = strings.TrimSpace(idxMatch[1]) + "_" + finalName
+	}
+
+	res.BookName = finalName
+
+	if state.GetStatus(finalName) == StatusCompleted {
+		fmt.Printf("⏭️  Skipping %s (Already completed)\n", finalName)
+		res.Path = filepath.Join(outputDir, sanitizePath(finalName))
+		return res
+	}
+
+	state.UpdateStatus(finalName, StatusDownloading)
+
+	matches := jsonRegex.FindStringSubmatch(html)
+	if len(matches) < 2 {
+		res.Errors = append(res.Errors, "No JSON")
+		return res
+	}
+
+	data := &BookData{}
+	if err := json.Unmarshal([]byte(matches[1]), data); err != nil {
+		res.Errors = append(res.Errors, err.Error())
+		return res
+	}
+	data.CoverAlt = strings.Split(data.Book.Cover, "-")[0] + ".jpg"
+	if d := descRegex.FindStringSubmatch(html); len(d) > 1 {
+		data.Description = regexp.MustCompile(`<[^>]*>`).ReplaceAllString(d[1], "")
+	}
+
+	bookDir := filepath.Join(outputDir, sanitizePath(finalName))
+	os.MkdirAll(bookDir, 0755)
+	res.Path = bookDir
+
+	downloadFileWithFallback([]string{data.CoverAlt, data.Book.Cover}, filepath.Join(bookDir, "cover.jpg"))
+	saveDescription(bookDir, data)
+
+	if bookConcurrency > 1 {
+		fmt.Printf("⬇️  Starting %s (%d tracks)\n", finalName, len(data.Playlist))
+	} else {
+		// Just a newline to separate from previous logs
+		fmt.Printf("\n📂 %s (%d tracks)\n", finalName, len(data.Playlist))
+	}
+
+	if err := downloadTracks(bookDir, data.Playlist, finalName); err != nil {
+		if err := downloadTracks(bookDir, data.MergedPlaylist, finalName); err != nil {
+			res.Errors = append(res.Errors, "All download methods failed")
+		}
+	}
+	return res
+}
+
+func downloadPage(u string) (string, error) {
+	req, _ := http.NewRequest("GET", u, nil)
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Cookie", "new_design=1")
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("HTTP status %d", resp.StatusCode)
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	return string(body), nil
+	b, err := io.ReadAll(resp.Body)
+	return string(b), err
 }
 
-func extractJSON(html string) (string, error) {
-	matches := jsonRegex.FindStringSubmatch(html)
-	if len(matches) < 2 {
-		return "", errors.New("JSON data not found in HTML")
-	}
-	return matches[1], nil
-}
-
-func parseBookJSON(jsonStr string) (*BookData, error) {
-	var data BookData
-	if err := json.Unmarshal([]byte(jsonStr), &data); err != nil {
-		return nil, err
-	}
-	return &data, nil
-}
-
-func extractDescription(html string) (string, error) {
-	matches := descRegex.FindStringSubmatch(html)
-	if len(matches) < 2 {
-		return "", errors.New("description not found")
-	}
-
-	text := regexp.MustCompile(`<[^>]*>`).ReplaceAllString(matches[1], "")
-	return text, nil
-}
-
-func sanitizePath(path string) string {
-	safe := forbiddenChars.ReplaceAllString(path, "_")
-
-	whitespace := regexp.MustCompile(`\s+`)
-	safe = whitespace.ReplaceAllString(safe, "_")
-
-	multiUnderscore := regexp.MustCompile(`_+`)
-	safe = multiUnderscore.ReplaceAllString(safe, "_")
-
-	safe = strings.Trim(safe, " ._")
-
-	reserved := []string{"CON", "PRN", "AUX", "NUL",
-		"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-		"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"}
-
-	for _, r := range reserved {
-		if strings.EqualFold(safe, r) {
-			return safe + "_"
-		}
-	}
-
+func sanitizePath(p string) string {
+	safe := strings.Trim(forbiddenChars.ReplaceAllString(p, "_"), " ._")
 	if safe == "" {
-		safe = "audiobook_file"
+		return "audiobook"
 	}
-
 	return safe
 }
 
-func downloadAssets(bookDir string, bookData *BookData, result *DownloadResult) {
-	if err := downloadWithFallback(
-		[]string{bookData.CoverAlt, bookData.Book.Cover},
-		filepath.Join(bookDir, "cover.jpg"),
-	); err != nil {
-		result.addError("cover download", err)
-	}
-
-	if err := saveDescription(bookDir, bookData); err != nil {
-		result.addError("save description", err)
-	}
-
-	if err := downloadPlaylist(bookDir, bookData, result); err != nil {
-		result.addError("playlist download", err)
-	}
-}
-
-func downloadWithFallback(urls []string, filePath string) error {
-	for _, url := range urls {
-		if url == "" {
-			continue
-		}
-		if err := downloadFile(url, filePath); err == nil {
-			return nil
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-	return errors.New("all download attempts failed")
-}
-
-func saveDescription(bookDir string, bookData *BookData) error {
-	getNames := func(data interface{}) string {
+func saveDescription(dir string, d *BookData) {
+	getName := func(v interface{}) string {
 		var names []string
-		switch v := data.(type) {
-		case map[string]interface{}:
-			for _, item := range v {
-				if person, ok := item.(map[string]interface{}); ok {
-					if name, ok := person["name"].(string); ok {
-						names = append(names, name)
-					}
+		if list, ok := v.([]interface{}); ok {
+			for _, i := range list {
+				if m, ok := i.(map[string]interface{}); ok {
+					names = append(names, fmt.Sprint(m["name"]))
 				}
 			}
-		case []interface{}:
-			for _, item := range v {
-				if person, ok := item.(map[string]interface{}); ok {
-					if name, ok := person["name"].(string); ok {
-						names = append(names, name)
-					}
+		} else if m, ok := v.(map[string]interface{}); ok {
+			for _, i := range m {
+				if p, ok := i.(map[string]interface{}); ok {
+					names = append(names, fmt.Sprint(p["name"]))
 				}
 			}
 		}
 		return strings.Join(names, ", ")
 	}
-
-	desc := fmt.Sprintf(
-		"Название: %s\nАвтор(ы): %s\nЧтец(ы): %s\n\nОписание:\n%s\n\nURL: %s",
-		bookData.Book.Name,
-		getNames(bookData.Book.Authors),
-		getNames(bookData.Book.Readers),
-		bookData.Description,
-		bookData.Book.URL,
-	)
-
-	return os.WriteFile(filepath.Join(bookDir, "Description.txt"), []byte(desc), 0644)
+	desc := fmt.Sprintf("Название: %s\nАвтор: %s\nЧтец: %s\n\n%s\nURL: %s",
+		d.Book.Name, getName(d.Book.Authors), getName(d.Book.Readers), d.Description, d.Book.URL)
+	os.WriteFile(filepath.Join(dir, "Description.txt"), []byte(desc), 0644)
 }
 
-func downloadPlaylist(bookDir string, bookData *BookData, result *DownloadResult) error {
-
-	debugLog("Playlist Check for: %s", bookData.Book.Name)
-	debugLog(" > Standard Tracks: %d", len(bookData.Playlist))
-	debugLog(" > Merged Tracks:   %d", len(bookData.MergedPlaylist))
-
-	err := downloadTracks(bookDir, bookData.Playlist, "STANDARD")
-	if err == nil {
-		return nil
+func downloadFileWithFallback(urls []string, dest string) {
+	for _, u := range urls {
+		if u == "" {
+			continue
+		}
+		if err := downloadFile(u, dest); err == nil {
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
-
-	debugLog("🔴 Standard Playlist Failed: %v", err)
-	fmt.Printf("   ⚠️  Standard download failed, trying merged file...\n")
-
-	if err := downloadTracks(bookDir, bookData.MergedPlaylist, "MERGED"); err != nil {
-		result.addError("playlist download", fmt.Errorf("ALL methods failed. Merged error: %v", err))
-		return err
-	}
-
-	return nil
 }
 
-func downloadTracks(bookDir string, tracks []Audio, sourceType string) error {
+func downloadTracks(dir string, tracks []Audio, bookName string) error {
 	if len(tracks) == 0 {
-		return fmt.Errorf("track list is empty")
+		return fmt.Errorf("empty playlist")
 	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var wg sync.WaitGroup
-	errChan := make(chan error, 1)
-
-	// Use trackConcurrency flag (Default: 5). If set to 1, loads strictly track by track.
-	workers := trackConcurrency
-	if workers < 1 {
-		workers = 1
+	wc := trackConcurrency
+	if wc < 1 {
+		wc = 1
 	}
-	sem := make(chan struct{}, workers)
+	sem := make(chan struct{}, wc)
+	errChan := make(chan error, 1)
+	var wg sync.WaitGroup
 
-	for i, track := range tracks {
+	var completed int32 = 0
+	total := int32(len(tracks))
+
+	// Only show progress bar if strictly sequential books
+	showProgress := bookConcurrency == 1
+
+	if showProgress {
+		fmt.Printf("\r⏳ [%s] 0/%d", bookName, total)
+	}
+
+	for _, t := range tracks {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
-
 		wg.Add(1)
-		go func(idx int, t Audio) {
+		go func(t Audio) {
 			defer wg.Done()
-
 			select {
 			case sem <- struct{}{}:
 				defer func() { <-sem }()
@@ -908,159 +532,75 @@ func downloadTracks(bookDir string, tracks []Audio, sourceType string) error {
 				return
 			}
 
-			cleanURL := strings.Split(t.URL, "?")[0]
-			ext := filepath.Ext(cleanURL)
+			ext := filepath.Ext(strings.Split(t.URL, "?")[0])
 			if ext == "" {
 				ext = ".mp3"
 			}
-			ext = strings.ToLower(ext)
+			dest := filepath.Join(dir, sanitizePath(t.Title)+strings.ToLower(ext))
 
-			filePath := filepath.Join(bookDir, sanitizePath(t.Title)+ext)
-
-			// If file already exists, it is done.
-			if _, err := os.Stat(filePath); err == nil {
-				return
-			}
-
-			// Clean up orphan .part files from previous runs
-			partFile := filePath + ".part"
-			os.Remove(partFile)
-
-			var lastErr error
-			for attempt := 1; attempt <= maxRetries; attempt++ {
-
-				// Use robust download (saves to .part first)
-				if err := downloadFileVerbose(t.URL, filePath); err == nil {
-					return
-				} else {
-					lastErr = err
-					if idx == 0 {
-						debugLog("[%s] Track 1 Retry %d/%d failed: %v", sourceType, attempt, maxRetries, err)
+			success := false
+			if _, err := os.Stat(dest); err == nil {
+				success = true
+			} else {
+				for i := 0; i < maxRetries; i++ {
+					if err := downloadFile(t.URL, dest); err == nil {
+						success = true
+						break
 					}
 					time.Sleep(retryDelay)
 				}
 			}
 
-			select {
-			case errChan <- fmt.Errorf("track '%s' failed: %w", t.Title, lastErr):
-				cancel()
-			default:
+			if success {
+				if showProgress {
+					c := atomic.AddInt32(&completed, 1)
+					p := float64(c) / float64(total) * 100
+					// %-70s pads the string to 70 chars with spaces to wipe artifacts
+					status := fmt.Sprintf("⏳ [%s] %d/%d (%.0f%%)", bookName, c, total, p)
+					fmt.Printf("\r%-80s", status)
+				}
+			} else {
+				select {
+				case errChan <- fmt.Errorf("failed: %s", t.Title):
+					cancel()
+				default:
+				}
 			}
-		}(i, track)
+		}(t)
+	}
+	wg.Wait()
+	close(errChan)
+
+	if showProgress {
+		// Clean finish line
+		fmt.Printf("\r✅ [%s] Completed %d tracks.%-40s", bookName, total, "")
 	}
 
-	go func() {
-		wg.Wait()
-		close(errChan)
-	}()
-
-	if err := <-errChan; err != nil {
-		return err
-	}
-	return nil
+	return <-errChan
 }
 
-// downloadFileVerbose downloads safely to a .part file to prevent corruptions if a VM thread is killed.
-func downloadFileVerbose(url, finalFilePath string) error {
-	partFilePath := finalFilePath + ".part"
-
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return fmt.Errorf("req build error: %w", err)
-	}
-
-	req.Header.Set("User-Agent", userAgent)
-	req.Header.Set("Referer", "https://knigavuhe.org/")
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("network error: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("HTTP %d (%s)", resp.StatusCode, http.StatusText(resp.StatusCode))
-	}
-
-	if resp.ContentLength == 0 {
-		return fmt.Errorf("HTTP body is empty (Content-Length: 0)")
-	}
-
-	// Write to .part file
-	file, err := os.Create(partFilePath)
-	if err != nil {
-		return fmt.Errorf("file create error: %w", err)
-	}
-
-	n, err := io.Copy(file, resp.Body)
-	file.Close() // Close immediately after copy so we can rename
-
-	if err != nil {
-		os.Remove(partFilePath)
-		return fmt.Errorf("io.Copy error: %w", err)
-	}
-
-	if n == 0 {
-		os.Remove(partFilePath)
-		return fmt.Errorf("wrote 0 bytes")
-	}
-
-	// Success! Rename .part to .mp3
-	if err := os.Rename(partFilePath, finalFilePath); err != nil {
-		return fmt.Errorf("failed to rename part file: %w", err)
-	}
-
-	return nil
-}
-
-func downloadFile(url, filePath string) error {
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return err
-	}
-
+func downloadFile(url, dest string) error {
+	part := dest + ".part"
+	req, _ := http.NewRequest("GET", url, nil)
 	req.Header.Set("User-Agent", userAgent)
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("HTTP status %d", resp.StatusCode)
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 
-	file, err := os.Create(filePath)
+	f, err := os.Create(part)
 	if err != nil {
 		return err
 	}
-	defer file.Close()
-
-	_, err = io.Copy(file, resp.Body)
-	return err
-}
-
-func normalizeURL(rawURL string) (string, error) {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return "", err
+	n, err := io.Copy(f, resp.Body)
+	f.Close()
+	if err != nil || n == 0 {
+		os.Remove(part)
+		return err
 	}
-
-	if u.Host == "m.knigavuhe.org" {
-		u.Host = "knigavuhe.org"
-	}
-	u.Scheme = "https"
-
-	return u.String(), nil
-}
-
-type DownloadResult struct {
-	URL      string
-	BookName string
-	Path     string
-	Errors   []string
-}
-
-func (r *DownloadResult) addError(context string, err error) {
-	r.Errors = append(r.Errors, fmt.Sprintf("%s: %v", context, err))
+	return os.Rename(part, dest)
 }

@@ -236,7 +236,24 @@ func lookupIPWithFallback(ctx context.Context, host string) ([]string, error) {
 	return nil, fmt.Errorf("all DNS resolvers failed: %v", lastErr)
 }
 
+// Windows Fix: Clean up .old files from previous updates
+func cleanupOldBinary() {
+	if runtime.GOOS == "windows" {
+		exe, err := os.Executable()
+		if err == nil {
+			oldExe := exe + ".old"
+			if _, err := os.Stat(oldExe); err == nil {
+				// Attempt to remove the old file. If it fails, we can't do much,
+				// but usually, the process is dead by now.
+				_ = os.Remove(oldExe)
+			}
+		}
+	}
+}
+
 func main() {
+	// Attempt to clean up artifacts from previous updates immediately
+	cleanupOldBinary()
 
 	var showVersion bool
 	var waitUpdate bool
@@ -249,7 +266,7 @@ func main() {
 	flag.Parse()
 
 	if showVersion {
-		fmt.Printf("Audiobook Downloader\n")
+		fmt.Printf("Go Knigavuhe Downloader\n")
 		fmt.Printf("Version:    %s\n", version)
 		fmt.Printf("Git Commit: %s\n", gitCommit)
 		fmt.Printf("Build Date: %s\n", buildDate)
@@ -267,7 +284,8 @@ func main() {
 				updated, err := checkAndApplyUpdate()
 				fmt.Printf(".")
 				if err != nil {
-					debugLog("Update check failed: %v", err)
+					// Print detailed error so user knows why it failed
+					fmt.Printf("\n❌ Update Failed: %v\n", err)
 				} else if updated {
 					fmt.Println("\n✅ Update applied successfully. Exiting to restart.")
 					os.Exit(0)
@@ -299,8 +317,8 @@ func main() {
 		fmt.Println("    -wait-update   : Loop and wait for update before exiting")
 		fmt.Println("    -version       : Show version info")
 		fmt.Println("    -verbose       : Show detailed output")
-		fmt.Println("  For series: audiobook-downloader [flags] <output-dir> <series-url>")
-		fmt.Println("  For file:   audiobook-downloader [flags] <output-dir> <url-file.txt>")
+		fmt.Println("  For series: go-knigavuhe [flags] <output-dir> <series-url>")
+		fmt.Println("  For file:   go-knigavuhe [flags] <output-dir> <url-file.txt>")
 		os.Exit(1)
 	}
 
@@ -428,10 +446,8 @@ func checkAndApplyUpdate() (bool, error) {
 	if remoteVersion == "" || remoteVersion == version {
 		return false, nil
 	}
-
 	fmt.Printf("⬆️  New version found: %s (Current: %s). Updating...\n", remoteVersion, version)
-
-	binName := fmt.Sprintf("audiobook-downloader-%s-%s", runtime.GOOS, runtime.GOARCH)
+	binName := fmt.Sprintf("go-knigavuhe-%s-%s", runtime.GOOS, runtime.GOARCH)
 	if runtime.GOOS == "windows" {
 		binName += ".exe"
 	}
@@ -450,12 +466,11 @@ func checkAndApplyUpdate() (bool, error) {
 	defer binResp.Body.Close()
 
 	if binResp.StatusCode != http.StatusOK {
-		return false, fmt.Errorf("binary download HTTP %d", binResp.StatusCode)
+		return false, fmt.Errorf("binary download HTTP %d from %s", binResp.StatusCode, binURL)
 	}
 
 	err = selfupdate.Apply(binResp.Body, selfupdate.Options{})
 	if err != nil {
-
 		return false, fmt.Errorf("failed to apply update: %w", err)
 	}
 

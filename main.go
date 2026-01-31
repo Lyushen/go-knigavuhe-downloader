@@ -26,7 +26,6 @@ import (
 	"github.com/minio/selfupdate"
 )
 
-// Injected via -ldflags
 var (
 	version   = "0.0.0"
 	gitCommit = ""
@@ -35,27 +34,23 @@ var (
 	updateURL = ""
 )
 
-// Person represents author/reader
 type Person struct {
 	Name string `json:"name"`
 }
 
-// Book represents book metadata
 type Book struct {
 	Name    string      `json:"name"`
-	Authors interface{} `json:"authors"` // Flexible type: map or slice
-	Readers interface{} `json:"readers"` // Flexible type: map or slice
+	Authors interface{} `json:"authors"`
+	Readers interface{} `json:"readers"`
 	Cover   string      `json:"cover"`
 	URL     string      `json:"url"`
 }
 
-// Audio represents an audio track
 type Audio struct {
 	Title string `json:"title"`
 	URL   string `json:"url"`
 }
 
-// BookData contains all book information
 type BookData struct {
 	Book           Book    `json:"book"`
 	Playlist       []Audio `json:"playlist"`
@@ -64,11 +59,10 @@ type BookData struct {
 	Description    string  `json:"-"`
 }
 
-// BookInfo holds series book information
 type BookInfo struct {
 	URL         string
-	DisplayName string // Includes series index (e.g., "1. Book Title")
-	SeriesIndex string // Now string to handle "6.1"
+	DisplayName string
+	SeriesIndex string
 }
 
 const (
@@ -83,12 +77,12 @@ var (
 	jsonRegex      = regexp.MustCompile(`BookController\.enter\((.*?)\);`)
 	descRegex      = regexp.MustCompile(`bookDescription\">(.+?)</div>`)
 	forbiddenChars = regexp.MustCompile(`[<>:"/\\|?*]`)
-	// Updated regex to handle indices like "6.1"
+
 	bookItemRegex  = regexp.MustCompile(`(?s)<div class="bookitem">(.*?)</div>\s*</div>`)
 	bookURLRegex   = regexp.MustCompile(`(?s)class="bookitem_cover"\s+href="/(book/[^"]+)"`)
 	bookIndexRegex = regexp.MustCompile(`(?s)<span class="bookitem_serie_index">\s*([\d\.]+)\.\s*</span>`)
 	bookTitleRegex = regexp.MustCompile(`(?s)<span class="bookitem_serie_index">\s*[\d\.]+\.\s*</span>\s*([^<]+)`)
-	// Custom Dialer that uses the fallback DNS logic
+
 	customDialer = &net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
@@ -99,29 +93,24 @@ var (
 		Transport: &http.Transport{
 			MaxIdleConns:    maxIdleConns,
 			IdleConnTimeout: 60 * time.Second,
-			// Override DialContext to perform DNS lookup manually
+
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				host, port, err := net.SplitHostPort(addr)
 				if err != nil {
 					return nil, err
 				}
 
-				// Check if host is already an IP
 				if net.ParseIP(host) != nil {
 					return customDialer.DialContext(ctx, network, addr)
 				}
 
-				// Perform DNS Lookup with Fallback
 				ips, err := lookupIPWithFallback(ctx, host)
 				if err != nil {
 					return nil, err
 				}
 
-				// Try to dial the first resolved IP
-				// (We reconstruct the address using the resolved IP and original port)
 				firstIP := ips[0]
 
-				// Handle IPv6 literal formatting for the URL if necessary
 				if strings.Contains(firstIP, ":") {
 					firstIP = "[" + firstIP + "]"
 				}
@@ -139,9 +128,8 @@ func debugLog(format string, v ...interface{}) {
 	}
 }
 
-// lookupIPWithFallback attempts to resolve a hostname using multiple DNS providers
 func lookupIPWithFallback(ctx context.Context, host string) ([]string, error) {
-	// 1. Define our specific resolvers
+
 	dnsProviders := []struct {
 		name     string
 		resolver *net.Resolver
@@ -174,13 +162,12 @@ func lookupIPWithFallback(ctx context.Context, host string) ([]string, error) {
 
 	var lastErr error
 
-	// 2. Iterate through providers
 	for _, provider := range dnsProviders {
-		// Use LookupIPAddr to get specific IP types if needed, but LookupHost is simpler for general use
+
 		ips, err := provider.resolver.LookupHost(ctx, host)
 		if err == nil && len(ips) > 0 {
 			if verboseMode && provider.name != "System" {
-				// Only log if we had to fallback, to keep output clean
+
 				fmt.Printf("DEBUG: Resolved %s using %s\n", host, provider.name)
 			}
 			return ips, nil
@@ -192,7 +179,7 @@ func lookupIPWithFallback(ctx context.Context, host string) ([]string, error) {
 }
 
 func main() {
-	// 1. Setup Flags
+
 	var showVersion bool
 	var waitUpdate bool
 
@@ -213,7 +200,6 @@ func main() {
 		os.Exit(0)
 	}
 
-	// 2. Self-Update Logic
 	if updateURL != "" {
 		if waitUpdate {
 			fmt.Printf("⏳ Waiting for update from %s...\n", updateURL)
@@ -228,7 +214,7 @@ func main() {
 				time.Sleep(5 * time.Second)
 			}
 		} else {
-			// Normal startup check
+
 			updated, err := checkAndApplyUpdate()
 			if err != nil {
 				if verboseMode {
@@ -243,7 +229,6 @@ func main() {
 		log.Fatal("❌ Cannot wait for update: No update URL injected at build time.")
 	}
 
-	// 3. Validate Arguments (use flag.Args() instead of os.Args)
 	args := flag.Args()
 	if len(args) < 2 {
 		fmt.Println("Usage:")
@@ -264,7 +249,7 @@ func main() {
 	}
 
 	var results []DownloadResult
-	// Check if input is a file
+
 	if strings.HasSuffix(strings.ToLower(inputArg), ".txt") || fileExists(inputArg) {
 		fmt.Printf("📄 Reading URLs from file: %s\n", inputArg)
 		lines, err := readLinesFromFile(inputArg)
@@ -279,7 +264,6 @@ func main() {
 				continue
 			}
 
-			// Check if line is a series URL
 			if strings.Contains(line, "/serie/") {
 				fmt.Printf("🔍 Extracting books from series: %s\n", line)
 				books, err := extractBooksFromSeries(line)
@@ -290,7 +274,7 @@ func main() {
 				allBooks = append(allBooks, books...)
 				fmt.Printf("✅ Found %d books\n", len(books))
 			} else {
-				// Treat as individual book URL
+
 				allBooks = append(allBooks, BookInfo{
 					URL:         line,
 					DisplayName: extractBookNameFromURL(line),
@@ -306,7 +290,7 @@ func main() {
 		fmt.Printf("🚀 Processing %d total books\n", len(allBooks))
 		results = processDownloads(outputDir, allBooks)
 	} else {
-		// Treat as series URL
+
 		fmt.Printf("🔍 Extracting books from series: %s\n", inputArg)
 		books, err := extractBooksFromSeries(inputArg)
 		if err != nil {
@@ -321,7 +305,6 @@ func main() {
 		results = processDownloads(outputDir, books)
 	}
 
-	// Print summary
 	fmt.Println("\n" + strings.Repeat("=", 60))
 	fmt.Println("📊 DOWNLOAD SUMMARY")
 	fmt.Println(strings.Repeat("=", 60))
@@ -338,10 +321,8 @@ func main() {
 	fmt.Println(strings.Repeat("=", 60))
 }
 
-// checkAndApplyUpdate checks for a new version and applies it if available.
-// Returns true if an update was applied.
 func checkAndApplyUpdate() (bool, error) {
-	// 1. Check version file
+
 	versionURL := strings.TrimRight(updateURL, "/") + "/version.txt"
 	req, err := http.NewRequest("GET", versionURL, nil)
 	if err != nil {
@@ -365,15 +346,12 @@ func checkAndApplyUpdate() (bool, error) {
 	}
 	remoteVersion := string(bytes.TrimSpace(remoteVersionBytes))
 
-	// Simple string comparison.
-	// NOTE: If you need semantic version logic, use "github.com/hashicorp/go-version"
 	if remoteVersion == "" || remoteVersion == version {
 		return false, nil
 	}
 
 	fmt.Printf("⬆️  New version found: %s (Current: %s). Updating...\n", remoteVersion, version)
 
-	// 2. Download binary
 	binName := fmt.Sprintf("audiobook-downloader-%s-%s", runtime.GOOS, runtime.GOARCH)
 	if runtime.GOOS == "windows" {
 		binName += ".exe"
@@ -396,11 +374,9 @@ func checkAndApplyUpdate() (bool, error) {
 		return false, fmt.Errorf("binary download HTTP %d", binResp.StatusCode)
 	}
 
-	// 3. Apply update
 	err = selfupdate.Apply(binResp.Body, selfupdate.Options{})
 	if err != nil {
-		// If the update failed, we might need to rollback or just report error
-		// selfupdate handles rollback of the binary file automatically in most cases
+
 		return false, fmt.Errorf("failed to apply update: %w", err)
 	}
 
@@ -433,9 +409,8 @@ func extractBookNameFromURL(bookURL string) string {
 	parts := strings.Split(bookURL, "/")
 	if len(parts) > 0 {
 		lastPart := parts[len(parts)-1]
-		lastPart = strings.TrimSuffix(lastPart, "/") // <- fix for S1017
+		lastPart = strings.TrimSuffix(lastPart, "/")
 
-		// Remove "book/123-" prefix if present
 		if idx := strings.Index(lastPart, "-"); idx > 0 {
 			lastPart = lastPart[idx+1:]
 		}
@@ -500,7 +475,6 @@ func extractBooksFromSeries(seriesURL string) ([]BookInfo, error) {
 		})
 	}
 
-	// Sort by series index using version number comparison
 	sort.Slice(books, func(i, j int) bool {
 		return compareIndices(books[i].SeriesIndex, books[j].SeriesIndex)
 	})
@@ -508,7 +482,6 @@ func extractBooksFromSeries(seriesURL string) ([]BookInfo, error) {
 	return books, nil
 }
 
-// compareIndices compares version-like indices (e.g., "1", "2", "6.1", "6.10")
 func compareIndices(a, b string) bool {
 	partsA := strings.Split(a, ".")
 	partsB := strings.Split(b, ".")
@@ -558,7 +531,6 @@ func processDownloads(outputDir string, books []BookInfo) []DownloadResult {
 		results = append(results, res)
 	}
 
-	// Sort results by series index
 	sort.Slice(results, func(i, j int) bool {
 		idxI := extractIndex(results[i].BookName)
 		idxJ := extractIndex(results[j].BookName)
@@ -686,18 +658,14 @@ func sanitizePath(path string) string {
 	// 1. Replace forbidden filesystem characters (<>:"/\|?*) with "_"
 	safe := forbiddenChars.ReplaceAllString(path, "_")
 
-	// 2. Replace spaces and all whitespace (tabs, newlines) with "_"
 	whitespace := regexp.MustCompile(`\s+`)
 	safe = whitespace.ReplaceAllString(safe, "_")
 
-	// 3. Collapse multiple underscores into one (e.g., "Book__Name" -> "Book_Name")
 	multiUnderscore := regexp.MustCompile(`_+`)
 	safe = multiUnderscore.ReplaceAllString(safe, "_")
 
-	// 4. Trim leading/trailing dots, spaces, and underscores
 	safe = strings.Trim(safe, " ._")
 
-	// 5. Handle Windows reserved filenames
 	reserved := []string{"CON", "PRN", "AUX", "NUL",
 		"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
 		"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"}
@@ -783,7 +751,7 @@ func saveDescription(bookDir string, bookData *BookData) error {
 }
 
 func downloadPlaylist(bookDir string, bookData *BookData, result *DownloadResult) error {
-	// DEBUG: Inspect the data structure
+
 	debugLog("Playlist Check for: %s", bookData.Book.Name)
 	debugLog(" > Standard Tracks: %d", len(bookData.Playlist))
 	debugLog(" > Merged Tracks:   %d", len(bookData.MergedPlaylist))
@@ -792,21 +760,17 @@ func downloadPlaylist(bookDir string, bookData *BookData, result *DownloadResult
 		debugLog(" > Sample Track URL: %s", bookData.Playlist[0].URL)
 	}
 
-	// Attempt 1: Standard Playlist
 	err := downloadTracks(bookDir, bookData.Playlist, "STANDARD")
 	if err == nil {
 		return nil
 	}
 
-	// Log technical error only in verbose mode
 	debugLog("🔴 Standard Playlist Failed: %v", err)
 
-	// Inform user cleanly that we are falling back
 	fmt.Printf("   ⚠️  Standard download failed, trying merged file...\n")
 
-	// Attempt 2: Merged Playlist
 	if err := downloadTracks(bookDir, bookData.MergedPlaylist, "MERGED"); err != nil {
-		// Only add error to result if BOTH fail
+
 		result.addError("playlist download", fmt.Errorf("ALL methods failed. Merged error: %v", err))
 		return err
 	}
@@ -824,7 +788,7 @@ func downloadTracks(bookDir string, tracks []Audio, sourceType string) error {
 
 	var wg sync.WaitGroup
 	errChan := make(chan error, 1)
-	sem := make(chan struct{}, 5) // Concurrency limit
+	sem := make(chan struct{}, 5)
 
 	for i, track := range tracks {
 		select {
@@ -844,28 +808,27 @@ func downloadTracks(bookDir string, tracks []Audio, sourceType string) error {
 				return
 			}
 
-			// --- FIX: Remove query parameters like ?1 from URL ---
 			cleanURL := strings.Split(t.URL, "?")[0]
 			ext := filepath.Ext(cleanURL)
 			if ext == "" {
 				ext = ".mp3"
 			}
 			ext = strings.ToLower(ext)
-			// Sanitize filename
+
 			filePath := filepath.Join(bookDir, sanitizePath(t.Title)+ext)
 
 			if _, err := os.Stat(filePath); err == nil {
-				return // File exists
+				return
 			}
 
 			var lastErr error
 			for attempt := 1; attempt <= maxRetries; attempt++ {
-				// We use the verbose downloader helper
+
 				if err := downloadFileVerbose(t.URL, filePath); err == nil {
 					return
 				} else {
 					lastErr = err
-					// Only log retries in verbose mode
+
 					if idx == 0 {
 						debugLog("[%s] Track 1 Retry %d/%d failed: %v", sourceType, attempt, maxRetries, err)
 					}
@@ -899,7 +862,7 @@ func downloadFileVerbose(url, filePath string) error {
 	}
 
 	req.Header.Set("User-Agent", userAgent)
-	// Some sites require Referer to allow direct mp3 downloads
+
 	req.Header.Set("Referer", "https://knigavuhe.org/")
 
 	resp, err := httpClient.Do(req)
@@ -909,11 +872,10 @@ func downloadFileVerbose(url, filePath string) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		// DEBUG 4: Capture the HTTP Code
+
 		return fmt.Errorf("HTTP %d (%s)", resp.StatusCode, http.StatusText(resp.StatusCode))
 	}
 
-	// Check for zero-byte files (common soft-fail)
 	if resp.ContentLength == 0 {
 		return fmt.Errorf("HTTP body is empty (Content-Length: 0)")
 	}
@@ -930,7 +892,7 @@ func downloadFileVerbose(url, filePath string) error {
 	}
 
 	if n == 0 {
-		os.Remove(filePath) // Cleanup empty file
+		os.Remove(filePath)
 		return fmt.Errorf("wrote 0 bytes")
 	}
 
@@ -978,7 +940,6 @@ func normalizeURL(rawURL string) (string, error) {
 	return u.String(), nil
 }
 
-// DownloadResult contains download status
 type DownloadResult struct {
 	URL      string
 	BookName string

@@ -91,11 +91,9 @@ jobs:
             output="go-knigavuhe-${GOOS}-${GOARCH}"
             [[ "$GOOS" == "windows" ]] && output+=".exe"
 
-            if [[ "$GOOS" == "windows" ]]; then
-              LDFLAGS="${BASE_LDFLAGS} -H windowsgui"
-            else
-              LDFLAGS="${BASE_LDFLAGS}"
-            fi
+            # REMOVED: The logic that added -H windowsgui
+            # We want standard console output for Windows too.
+            LDFLAGS="${BASE_LDFLAGS}"
 
             echo "==> Building ${output}"
             CGO_ENABLED=0 GOOS=$GOOS GOARCH=$GOARCH \

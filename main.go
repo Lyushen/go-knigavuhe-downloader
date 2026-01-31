@@ -205,10 +205,11 @@ func main() {
 			fmt.Printf("⏳ Waiting for update from %s...\n", updateURL)
 			for {
 				updated, err := checkAndApplyUpdate()
+				fmt.Printf(".")
 				if err != nil {
 					debugLog("Update check failed: %v", err)
 				} else if updated {
-					fmt.Println("✅ Update applied successfully. Exiting to restart.")
+					fmt.Println("\n✅ Update applied successfully. Exiting to restart.")
 					os.Exit(0)
 				}
 				time.Sleep(5 * time.Second)
@@ -232,11 +233,12 @@ func main() {
 	args := flag.Args()
 	if len(args) < 2 {
 		fmt.Println("Usage:")
-		fmt.Println("  For series: audiobook-downloader <output-dir> <series-url> [-verbose]")
-		fmt.Println("  For file:   audiobook-downloader <output-dir> <url-file.txt> [-verbose]")
 		fmt.Println("  Flags:")
 		fmt.Println("    -wait-update : Loop and wait for update before exiting")
 		fmt.Println("    -version     : Show version info")
+		fmt.Println("    -verbose     : Show detailed output")
+		fmt.Println("  For series: audiobook-downloader <output-dir> <series-url>")
+		fmt.Println("  For file:   audiobook-downloader <output-dir> <url-file.txt>")
 		fmt.Println("  <output-dir>   : Directory to save audiobooks")
 		os.Exit(1)
 	}

@@ -28,10 +28,10 @@ import (
 
 // Injected via -ldflags
 var (
-	version   = "dev"
-	gitCommit = "none"
-	buildDate = "unknown"
-	goVersion = "unknown"
+	version   = "0.0.0"
+	gitCommit = ""
+	buildDate = ""
+	goVersion = ""
 	updateURL = ""
 )
 

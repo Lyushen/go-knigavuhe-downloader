@@ -10,7 +10,6 @@ permissions:
   contents: write
 
 env:
-  # base version portion (used to generate v1.1.${{ github.run_number }})
   BASE_VERSION: "1.1"
 
 jobs:

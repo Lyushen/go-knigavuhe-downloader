@@ -148,10 +148,11 @@ var (
 	}
 
 	httpClient = &http.Client{
-		Timeout: 30 * time.Second,
+		Timeout: 0,
 		Transport: &http.Transport{
-			MaxIdleConns:    maxIdleConns,
-			IdleConnTimeout: 60 * time.Second,
+			MaxIdleConns:          maxIdleConns,
+			IdleConnTimeout:       60 * time.Second,
+			ResponseHeaderTimeout: 30 * time.Second,
 
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				host, port, err := net.SplitHostPort(addr)
@@ -169,7 +170,6 @@ var (
 				}
 
 				firstIP := ips[0]
-
 				if strings.Contains(firstIP, ":") {
 					firstIP = "[" + firstIP + "]"
 				}
@@ -550,15 +550,27 @@ func extractBooksFromSeries(seriesURL string) ([]BookInfo, error) {
 }
 
 func compareIndices(a, b string) bool {
+	// Remove parens if present "(1)" -> "1"
+	a = strings.Trim(a, "()")
+	b = strings.Trim(b, "()")
+
 	partsA := strings.Split(a, ".")
 	partsB := strings.Split(b, ".")
 
 	for i := 0; i < len(partsA) && i < len(partsB); i++ {
-		numA, _ := strconv.Atoi(partsA[i])
-		numB, _ := strconv.Atoi(partsB[i])
+		numA, errA := strconv.Atoi(partsA[i])
+		numB, errB := strconv.Atoi(partsB[i])
 
-		if numA != numB {
-			return numA < numB
+		// If both are numbers, compare numerically
+		if errA == nil && errB == nil {
+			if numA != numB {
+				return numA < numB
+			}
+		} else {
+			// Fallback to string comparison
+			if partsA[i] != partsB[i] {
+				return partsA[i] < partsB[i]
+			}
 		}
 	}
 
@@ -566,70 +578,66 @@ func compareIndices(a, b string) bool {
 }
 
 func processDownloads(outputDir string, books []BookInfo, state *DownloadState) []DownloadResult {
-	var wg sync.WaitGroup
-	bookChan := make(chan BookInfo, len(books))
-	resultChan := make(chan DownloadResult, len(books))
-
-	// Control book concurrency with flag (Default: 1 - sequential)
-	workers := bookConcurrency
-	if workers < 1 {
-		workers = 1
-	}
-
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for book := range bookChan {
-				// Skip if already completed from a previous run
-				if state.GetStatus(book.DisplayName) == StatusCompleted {
-					fmt.Printf("⏭️  Skipping %s (Already completed)\n", book.DisplayName)
-					resultChan <- DownloadResult{URL: book.URL, BookName: book.DisplayName, Path: filepath.Join(outputDir, sanitizePath(book.DisplayName))}
-					continue
-				}
-
-				state.UpdateStatus(book.DisplayName, StatusDownloading)
-				result := downloadBook(book.URL, outputDir, book.DisplayName)
-
-				if len(result.Errors) == 0 {
-					state.UpdateStatus(book.DisplayName, StatusCompleted)
-				} else {
-					state.UpdateStatus(book.DisplayName, StatusFailed)
-				}
-				resultChan <- result
-			}
-		}()
-	}
-
-	for i, book := range books {
-		fmt.Printf("📝 Queuing %d/%d: %s\n", i+1, len(books), book.DisplayName)
-		// Mark as pending if not already tracked
-		if state.GetStatus(book.DisplayName) == "" {
-			state.UpdateStatus(book.DisplayName, StatusPending)
-		}
-		bookChan <- book
-	}
-	close(bookChan)
-
-	go func() {
-		wg.Wait()
-		close(resultChan)
-	}()
-
-	results := make([]DownloadResult, 0, len(books))
-	for res := range resultChan {
-		results = append(results, res)
-	}
-
-	sort.Slice(results, func(i, j int) bool {
-		idxI := extractIndex(results[i].BookName)
-		idxJ := extractIndex(results[j].BookName)
-		return compareIndices(idxI, idxJ)
+	// 1. Sort books by Series Index (Numeric sort: 1, 2, 10 instead of 1, 10, 2)
+	sort.Slice(books, func(i, j int) bool {
+		return compareIndices(books[i].SeriesIndex, books[j].SeriesIndex)
 	})
+
+	fmt.Println("📚 Sorted processing queue:")
+	for _, b := range books {
+		status := state.GetStatus(b.DisplayName)
+		if status == "" {
+			status = "Ready"
+		}
+		fmt.Printf("   [%s] %s (Index: %s)\n", status, b.DisplayName, b.SeriesIndex)
+	}
+	fmt.Println(strings.Repeat("-", 40))
+
+	var results []DownloadResult
+
+	// 2. Strict Sequential Processing
+	for i, book := range books {
+		// Calculate overall progress
+		fmt.Printf("\n🚀 Processing Book %d/%d: %s\n", i+1, len(books), book.DisplayName)
+
+		// Check Status
+		currentStatus := state.GetStatus(book.DisplayName)
+
+		// If completed, skip
+		if currentStatus == StatusCompleted {
+			fmt.Printf("⏭️  Skipping (Already completed)\n")
+			safeName := sanitizePath(book.DisplayName)
+			// We attempt to guess the path to return a valid result even if skipped
+			results = append(results, DownloadResult{
+				URL:      book.URL,
+				BookName: book.DisplayName,
+				Path:     filepath.Join(outputDir, safeName),
+			})
+			continue
+		}
+
+		// Update State to Downloading
+		state.UpdateStatus(book.DisplayName, StatusDownloading)
+
+		// Download
+		result := downloadBook(book.URL, outputDir, book.DisplayName)
+
+		if len(result.Errors) == 0 {
+			state.UpdateStatus(book.DisplayName, StatusCompleted)
+			fmt.Printf("✅ Book Completed: %s\n", result.BookName)
+		} else {
+			state.UpdateStatus(book.DisplayName, StatusFailed)
+			fmt.Printf("❌ Book Failed: %s\n", result.BookName)
+		}
+
+		results = append(results, result)
+
+		// Optional: Small pause between books to be gentle on the server
+		time.Sleep(1 * time.Second)
+	}
 
 	return results
 }
-
 func extractIndex(bookName string) string {
 	parts := strings.SplitN(bookName, ".", 2)
 	if len(parts) > 0 {
@@ -1024,22 +1032,24 @@ func downloadTracks(bookDir string, tracks []Audio, sourceType string) error {
 	return nil
 }
 
-func downloadFileVerbose(downloadURL, finalFilePath string) error {
+func downloadFileVerbose(downloadUrl, finalFilePath string) error {
 	partFilePath := finalFilePath + ".part"
 
-	req, err := http.NewRequest("GET", downloadURL, nil)
+	req, err := http.NewRequest("GET", downloadUrl, nil)
 	if err != nil {
 		return fmt.Errorf("request build error: %w", err)
 	}
 
 	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Referer", "https://knigavuhe.org/")
-	// Connection close can help prevent keeping dead sockets in unstable networks
-	req.Header.Set("Connection", "keep-alive")
+
+	// FIX: Disable Keep-Alive.
+	// This forces a new TCP connection for every file.
+	// Helps prevent "Unexpected EOF" caused by the server closing idle connections.
+	req.Close = true
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		// Analyze URL error
 		if urlErr, ok := err.(*url.Error); ok {
 			if urlErr.Timeout() {
 				return fmt.Errorf("connection timed out: %w", err)
@@ -1053,37 +1063,29 @@ func downloadFileVerbose(downloadURL, finalFilePath string) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		// Log detailed server response for debugging
-		return fmt.Errorf("server returned HTTP %d (%s) | Content-Type: %s",
-			resp.StatusCode,
-			http.StatusText(resp.StatusCode),
-			resp.Header.Get("Content-Type"))
+		return fmt.Errorf("server returned HTTP %d (%s)", resp.StatusCode, http.StatusText(resp.StatusCode))
 	}
 
 	if resp.ContentLength == 0 {
 		return fmt.Errorf("server sent empty body (Content-Length: 0)")
 	}
 
-	// Create .part file
 	file, err := os.Create(partFilePath)
 	if err != nil {
 		return fmt.Errorf("filesystem error (create): %w", err)
 	}
 
-	// Copy with buffer
 	n, err := io.Copy(file, resp.Body)
-	file.Close() // Close specifically to flush and release lock for rename
+	file.Close()
 
 	if err != nil {
-		os.Remove(partFilePath) // Clean up partial
-		// Check for "unexpected EOF" which usually means connection dropped mid-stream
+		os.Remove(partFilePath)
 		if err == io.ErrUnexpectedEOF {
-			return fmt.Errorf("connection dropped during download: %w", err)
+			return fmt.Errorf("connection dropped during download (EOF): %w", err)
 		}
 		return fmt.Errorf("write error: %w", err)
 	}
 
-	// Verify size if Content-Length was provided
 	if resp.ContentLength > 0 && n != resp.ContentLength {
 		os.Remove(partFilePath)
 		return fmt.Errorf("incomplete download: expected %d bytes, got %d", resp.ContentLength, n)
@@ -1094,9 +1096,8 @@ func downloadFileVerbose(downloadURL, finalFilePath string) error {
 		return fmt.Errorf("downloaded 0 bytes")
 	}
 
-	// Atomic rename
 	if err := os.Rename(partFilePath, finalFilePath); err != nil {
-		return fmt.Errorf("rename failed (check permissions/locks): %w", err)
+		return fmt.Errorf("rename failed: %w", err)
 	}
 
 	return nil

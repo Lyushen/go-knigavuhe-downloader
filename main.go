@@ -21,7 +21,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/minio/selfupdate"
@@ -625,13 +624,6 @@ func processDownloads(outputDir string, books []BookInfo, state *DownloadState) 
 
 	return results
 }
-func extractIndex(bookName string) string {
-	parts := strings.SplitN(bookName, ".", 2)
-	if len(parts) > 0 {
-		return parts[0]
-	}
-	return "999"
-}
 
 func downloadBook(bookURL, outputDir, displayName string) DownloadResult {
 	result := DownloadResult{URL: bookURL}
@@ -878,119 +870,85 @@ func downloadTracks(bookDir string, tracks []Audio, sourceType string) error {
 		return fmt.Errorf("track list is empty")
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// 1. SORT tracks naturally before processing (1, 2, 10...)
+	sortTracksNaturally(tracks)
 
-	var wg sync.WaitGroup
-	errChan := make(chan error, 1)
-
-	workers := trackConcurrency
-	if workers < 1 {
-		workers = 1
-	}
-	sem := make(chan struct{}, workers)
+	// If using sequential mode (or if forced by the user logic), we don't use goroutines.
+	// This ensures logs appear exactly in order: 1, 2, 3...
 
 	totalTracks := len(tracks)
-	var completedTracks int32
+	var completedTracks int = 0
 
 	if !verboseMode {
 		fmt.Println()
 	}
 
-	for i, track := range tracks {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
+	for _, track := range tracks {
+		cleanURL := strings.Split(track.URL, "?")[0]
+		ext := filepath.Ext(cleanURL)
+		if ext == "" {
+			ext = ".mp3"
 		}
+		ext = strings.ToLower(ext)
 
-		wg.Add(1)
-		go func(idx int, t Audio) {
-			defer wg.Done()
+		safeTitle := sanitizePath(track.Title)
+		// Ensure filename starts with index to keep folder sort order if titles are messy
+		// Optional: You can remove the fmt.Sprintf part if you trust the title.
+		// But usually it's safer to rely on the sorted list index.
+		// fileName := fmt.Sprintf("%03d_%s%s", i+1, safeTitle, ext)
+		// For now, let's stick to your original title logic:
+		filePath := filepath.Join(bookDir, safeTitle+ext)
+		partFile := filePath + ".part"
 
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-			case <-ctx.Done():
-				return
-			}
-
-			cleanURL := strings.Split(t.URL, "?")[0]
-			ext := filepath.Ext(cleanURL)
-			if ext == "" {
-				ext = ".mp3"
-			}
-			ext = strings.ToLower(ext)
-
-			safeTitle := sanitizePath(t.Title)
-			filePath := filepath.Join(bookDir, safeTitle+ext)
-			partFile := filePath + ".part"
-
-			if !verboseMode {
-				current := atomic.AddInt32(&completedTracks, 0)
-				percent := float64(current) / float64(totalTracks) * 100
-
-				displayTitle := safeTitle
-				if len(displayTitle) > 20 {
-					displayTitle = displayTitle[:17] + "..."
-				}
-				fmt.Printf("\r⬇️  [%s] %3.0f%% (%d/%d): %-25s", sourceType, percent, current, totalTracks, displayTitle)
-			} else {
-				fmt.Printf("⬇️  Starting: %s\n", safeTitle)
-			}
-
-			if info, err := os.Stat(filePath); err == nil && info.Size() > 0 {
-				atomic.AddInt32(&completedTracks, 1)
-				return
-			}
-
-			var lastErr error
-			success := false
-
-			for attempt := 1; attempt <= maxRetries; attempt++ {
-				if ctx.Err() != nil {
-					return
-				}
-
-				err := downloadFileResumable(t.URL, filePath)
-				if err == nil {
-					success = true
-					break
-				} else {
-					lastErr = err
-
-					if verboseMode {
-						log.Printf("⚠️  Retry %d/%d for '%s': %v", attempt, maxRetries, safeTitle, err)
-					}
-
-					time.Sleep(time.Duration(attempt) * retryDelay)
-				}
-			}
-
-			if !success {
-
-				os.Remove(partFile)
-				select {
-				case errChan <- fmt.Errorf("track '%s' failed: %w", t.Title, lastErr):
-					cancel()
-				default:
-				}
-			} else {
-				atomic.AddInt32(&completedTracks, 1)
-			}
-		}(i, track)
-	}
-
-	go func() {
-		wg.Wait()
-		close(errChan)
-	}()
-
-	if err := <-errChan; err != nil {
+		// Visualization
 		if !verboseMode {
-			fmt.Println()
+			percent := float64(completedTracks) / float64(totalTracks) * 100
+			displayTitle := safeTitle
+			if len(displayTitle) > 25 {
+				displayTitle = displayTitle[:22] + "..."
+			}
+			// \r clears line
+			fmt.Printf("\r⬇️  [%s] %3.0f%% (%d/%d): %-30s", sourceType, percent, completedTracks+1, totalTracks, displayTitle)
+		} else {
+			fmt.Printf("⬇️  Starting: %s\n", safeTitle)
 		}
-		return err
+
+		// Check existence
+		if info, err := os.Stat(filePath); err == nil && info.Size() > 0 {
+			completedTracks++
+			continue
+		}
+
+		// Download Loop (Sequential)
+		success := false
+		var lastErr error
+
+		for attempt := 1; attempt <= maxRetries; attempt++ {
+			err := downloadFileResumable(track.URL, filePath)
+			if err == nil {
+				success = true
+				break
+			}
+			lastErr = err
+
+			if verboseMode {
+				log.Printf("⚠️  Retry %d/%d for '%s': %v", attempt, maxRetries, safeTitle, err)
+			}
+			// Exponential backoff
+			time.Sleep(time.Duration(attempt) * retryDelay)
+		}
+
+		if !success {
+			// Clean up and return error immediately to stop the chain
+			os.Remove(partFile)
+			if !verboseMode {
+				fmt.Println() // Newline so error isn't overwritten
+			}
+			return fmt.Errorf("track '%s' failed: %w", track.Title, lastErr)
+		}
+
+		completedTracks++
+		time.Sleep(500 * time.Millisecond)
 	}
 
 	if !verboseMode {
@@ -1133,4 +1091,58 @@ type DownloadResult struct {
 
 func (r *DownloadResult) addError(context string, err error) {
 	r.Errors = append(r.Errors, fmt.Sprintf("%s: %v", context, err))
+}
+func sortTracksNaturally(tracks []Audio) {
+	sort.Slice(tracks, func(i, j int) bool {
+		return compareNatural(tracks[i].Title, tracks[j].Title)
+	})
+}
+func compareNatural(a, b string) bool {
+	// Tokenize strings into runs of digits and non-digits
+	tokensA := tokenize(a)
+	tokensB := tokenize(b)
+
+	lenA, lenB := len(tokensA), len(tokensB)
+	limit := lenA
+	if lenB < limit {
+		limit = lenB
+	}
+
+	for k := 0; k < limit; k++ {
+		// If both tokens are digits, compare numerically
+		valA, errA := strconv.Atoi(tokensA[k])
+		valB, errB := strconv.Atoi(tokensB[k])
+
+		if errA == nil && errB == nil {
+			if valA != valB {
+				return valA < valB
+			}
+		} else {
+			// Compare lexically (case-insensitive for better results)
+			if strings.EqualFold(strings.ToLower(tokensA[k]), strings.ToLower(tokensB[k])) {
+				return strings.ToLower(tokensA[k]) < strings.ToLower(tokensB[k])
+			}
+		}
+	}
+
+	return lenA < lenB
+}
+func tokenize(s string) []string {
+	var tokens []string
+	var currentToken strings.Builder
+	isDigit := false
+
+	for _, r := range s {
+		newIsDigit := r >= '0' && r <= '9'
+		if currentToken.Len() > 0 && newIsDigit != isDigit {
+			tokens = append(tokens, currentToken.String())
+			currentToken.Reset()
+		}
+		isDigit = newIsDigit
+		currentToken.WriteRune(r)
+	}
+	if currentToken.Len() > 0 {
+		tokens = append(tokens, currentToken.String())
+	}
+	return tokens
 }

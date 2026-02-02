@@ -31,7 +31,6 @@ var (
 	version, gitCommit, buildDate, goVersion, updateURL string
 )
 
-// Global flags
 var (
 	verboseMode      bool
 	bookConcurrency  int
@@ -69,7 +68,6 @@ type BookInfo struct {
 	URL, DisplayName, SeriesIndex string
 }
 
-// State tracking structures
 type BookStatus string
 
 const (
@@ -122,11 +120,10 @@ func (s *DownloadState) DeleteIfComplete() {
 }
 
 const (
-	userAgent    = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36 Edg/135.0.0.0"
-	cookie       = "new_design=1"
-	maxRetries   = 5
-	retryDelay   = 2 * time.Second
-	maxIdleConns = 1
+	userAgent  = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36 Edg/135.0.0.0"
+	cookie     = "new_design=1"
+	maxRetries = 5
+	retryDelay = 2 * time.Second
 )
 
 var (
@@ -150,8 +147,9 @@ var (
 	httpClient = &http.Client{
 		Timeout: 0,
 		Transport: &http.Transport{
-			MaxIdleConns:          maxIdleConns,
-			IdleConnTimeout:       60 * time.Second,
+			MaxIdleConns:          -1,
+			DisableKeepAlives:     true,
+			IdleConnTimeout:       1 * time.Second,
 			ResponseHeaderTimeout: 30 * time.Second,
 
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -236,7 +234,6 @@ func lookupIPWithFallback(ctx context.Context, host string) ([]string, error) {
 	return nil, fmt.Errorf("all DNS resolvers failed: %v", lastErr)
 }
 
-// Windows Fix: Clean up .old files from previous updates
 func cleanupOldBinary() {
 	if runtime.GOOS == "windows" {
 		exe, err := os.Executable()
@@ -244,7 +241,7 @@ func cleanupOldBinary() {
 			oldExe := exe + ".old"
 			if _, err := os.Stat(oldExe); err == nil {
 				// Attempt to remove the old file. If it fails, we can't do much,
-				// but usually, the process is dead by now.
+
 				_ = os.Remove(oldExe)
 			}
 		}
@@ -252,7 +249,7 @@ func cleanupOldBinary() {
 }
 
 func main() {
-	// Attempt to clean up artifacts from previous updates immediately
+
 	cleanupOldBinary()
 
 	var showVersion bool
@@ -260,7 +257,7 @@ func main() {
 
 	flag.BoolVar(&verboseMode, "verbose", false, "Show detailed technical logs")
 	flag.BoolVar(&showVersion, "version", false, "Print version information and exit")
-	flag.BoolVar(&waitUpdate, "wait-update", false, "Wait for a new version to be available, update, and then exit")
+	flag.BoolVar(&waitUpdate, "update", false, "Wait for a new version to be available, update, and then exit")
 	flag.IntVar(&bookConcurrency, "book-workers", 1, "Number of books to download in parallel (default: 1 for sequential)")
 	flag.IntVar(&trackConcurrency, "track-workers", 5, "Number of tracks to download in parallel per book (default: 5)")
 	flag.Parse()
@@ -284,7 +281,6 @@ func main() {
 				updated, err := checkAndApplyUpdate()
 				fmt.Printf(".")
 				if err != nil {
-					// Print detailed error so user knows why it failed
 					fmt.Printf("\n❌ Update Failed: %v\n", err)
 				} else if updated {
 					fmt.Println("\n✅ Update applied successfully. Exiting to restart.")
@@ -318,14 +314,12 @@ func main() {
 		log.Fatalf("Error creating output directory: %v", err)
 	}
 
-	// Initialize State
 	statePath := filepath.Join(outputDir, "state.json")
 	state := &DownloadState{
 		Books: make(map[string]BookStatus),
 		path:  statePath,
 	}
 
-	// Load existing state if available
 	if stateData, err := os.ReadFile(statePath); err == nil {
 		json.Unmarshal(stateData, state)
 		fmt.Println("🔄 Resuming from previous state...")
@@ -550,7 +544,7 @@ func extractBooksFromSeries(seriesURL string) ([]BookInfo, error) {
 }
 
 func compareIndices(a, b string) bool {
-	// Remove parens if present "(1)" -> "1"
+
 	a = strings.Trim(a, "()")
 	b = strings.Trim(b, "()")
 
@@ -561,13 +555,12 @@ func compareIndices(a, b string) bool {
 		numA, errA := strconv.Atoi(partsA[i])
 		numB, errB := strconv.Atoi(partsB[i])
 
-		// If both are numbers, compare numerically
 		if errA == nil && errB == nil {
 			if numA != numB {
 				return numA < numB
 			}
 		} else {
-			// Fallback to string comparison
+
 			if partsA[i] != partsB[i] {
 				return partsA[i] < partsB[i]
 			}
@@ -578,7 +571,7 @@ func compareIndices(a, b string) bool {
 }
 
 func processDownloads(outputDir string, books []BookInfo, state *DownloadState) []DownloadResult {
-	// 1. Sort books by Series Index (Numeric sort: 1, 2, 10 instead of 1, 10, 2)
+
 	sort.Slice(books, func(i, j int) bool {
 		return compareIndices(books[i].SeriesIndex, books[j].SeriesIndex)
 	})
@@ -595,19 +588,16 @@ func processDownloads(outputDir string, books []BookInfo, state *DownloadState) 
 
 	var results []DownloadResult
 
-	// 2. Strict Sequential Processing
 	for i, book := range books {
-		// Calculate overall progress
+
 		fmt.Printf("\n🚀 Processing Book %d/%d: %s\n", i+1, len(books), book.DisplayName)
 
-		// Check Status
 		currentStatus := state.GetStatus(book.DisplayName)
 
-		// If completed, skip
 		if currentStatus == StatusCompleted {
 			fmt.Printf("⏭️  Skipping (Already completed)\n")
 			safeName := sanitizePath(book.DisplayName)
-			// We attempt to guess the path to return a valid result even if skipped
+
 			results = append(results, DownloadResult{
 				URL:      book.URL,
 				BookName: book.DisplayName,
@@ -616,10 +606,8 @@ func processDownloads(outputDir string, books []BookInfo, state *DownloadState) 
 			continue
 		}
 
-		// Update State to Downloading
 		state.UpdateStatus(book.DisplayName, StatusDownloading)
 
-		// Download
 		result := downloadBook(book.URL, outputDir, book.DisplayName)
 
 		if len(result.Errors) == 0 {
@@ -632,7 +620,6 @@ func processDownloads(outputDir string, books []BookInfo, state *DownloadState) 
 
 		results = append(results, result)
 
-		// Optional: Small pause between books to be gentle on the server
 		time.Sleep(1 * time.Second)
 	}
 
@@ -661,11 +648,9 @@ func downloadBook(bookURL, outputDir, displayName string) DownloadResult {
 		return result
 	}
 
-	// NEW: Determine folder name logic
-	// If series data exists, format as "Index_SeriesName". Otherwise use Book Name.
 	folderName := displayName
 	if bookData.SeriesName != "" && bookData.SeriesIndex != "" {
-		// Example: 1_Legendary_Moon_Sculptor
+
 		folderName = fmt.Sprintf("%s_%s", bookData.SeriesIndex, bookData.SeriesName)
 	} else if bookData.SeriesName != "" {
 		folderName = bookData.SeriesName
@@ -673,13 +658,10 @@ func downloadBook(bookURL, outputDir, displayName string) DownloadResult {
 		folderName = bookData.Book.Name
 	}
 
-	// Apply snake_case sanitization
 	safeFolderName := sanitizePath(folderName)
 
-	// Update displayName to reflect the actual folder being used for logging
 	displayName = safeFolderName
 
-	// ENSURE FOLDER EXISTS
 	bookDir := filepath.Join(outputDir, safeFolderName)
 	if err := os.MkdirAll(bookDir, 0755); err != nil {
 		result.addError("create directory", err)
@@ -717,16 +699,13 @@ func fetchBookData(bookURL string) (*BookData, error) {
 		bookData.Description = desc
 	}
 
-	// NEW: Extract Series Information from HTML
 	if seriesMatch := seriesBlockRegex.FindStringSubmatch(html); len(seriesMatch) > 1 {
 		blockContent := seriesMatch[1]
 
-		// Extract Name
 		if nameMatch := seriesNameRegex.FindStringSubmatch(blockContent); len(nameMatch) > 1 {
 			bookData.SeriesName = strings.TrimSpace(nameMatch[1])
 		}
 
-		// Extract Index
 		if indexMatch := seriesIndexRegex.FindStringSubmatch(blockContent); len(indexMatch) > 1 {
 			bookData.SeriesIndex = strings.TrimSpace(indexMatch[1])
 		}
@@ -905,7 +884,6 @@ func downloadTracks(bookDir string, tracks []Audio, sourceType string) error {
 	var wg sync.WaitGroup
 	errChan := make(chan error, 1)
 
-	// Use trackConcurrency flag (Default: 5).
 	workers := trackConcurrency
 	if workers < 1 {
 		workers = 1
@@ -915,13 +893,11 @@ func downloadTracks(bookDir string, tracks []Audio, sourceType string) error {
 	totalTracks := len(tracks)
 	var completedTracks int32
 
-	// Newline before starting to prevent overwriting previous logs
 	if !verboseMode {
 		fmt.Println()
 	}
 
 	for i, track := range tracks {
-		// Check context before queuing
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -946,66 +922,57 @@ func downloadTracks(bookDir string, tracks []Audio, sourceType string) error {
 			}
 			ext = strings.ToLower(ext)
 
-			// Sanitize filename to snake_case
 			safeTitle := sanitizePath(t.Title)
 			filePath := filepath.Join(bookDir, safeTitle+ext)
+			partFile := filePath + ".part"
 
-			// Progress Update (Visual)
 			if !verboseMode {
-				// Calculate percentage
-				current := atomic.AddInt32(&completedTracks, 0) // Read current
+				current := atomic.AddInt32(&completedTracks, 0)
 				percent := float64(current) / float64(totalTracks) * 100
 
-				// Truncate title for display
 				displayTitle := safeTitle
 				if len(displayTitle) > 20 {
 					displayTitle = displayTitle[:17] + "..."
 				}
-
-				// \r moves cursor to start of line to overwrite
 				fmt.Printf("\r⬇️  [%s] %3.0f%% (%d/%d): %-25s", sourceType, percent, current, totalTracks, displayTitle)
 			} else {
 				fmt.Printf("⬇️  Starting: %s\n", safeTitle)
 			}
 
-			// If file already exists and has size, skip
 			if info, err := os.Stat(filePath); err == nil && info.Size() > 0 {
 				atomic.AddInt32(&completedTracks, 1)
 				return
 			}
 
-			// Clean up orphan .part files
-			partFile := filePath + ".part"
-			os.Remove(partFile)
-
 			var lastErr error
 			success := false
 
 			for attempt := 1; attempt <= maxRetries; attempt++ {
-				// Check context again before retry
 				if ctx.Err() != nil {
 					return
 				}
 
-				if err := downloadFileVerbose(t.URL, filePath); err == nil {
+				err := downloadFileResumable(t.URL, filePath)
+				if err == nil {
 					success = true
 					break
 				} else {
 					lastErr = err
+
 					if verboseMode {
 						log.Printf("⚠️  Retry %d/%d for '%s': %v", attempt, maxRetries, safeTitle, err)
 					}
-					// Backoff
+
 					time.Sleep(time.Duration(attempt) * retryDelay)
 				}
 			}
 
 			if !success {
-				// Signal error to stop other workers if strictly required,
-				// or just log it. Here we abort on failure.
+
+				os.Remove(partFile)
 				select {
-				case errChan <- fmt.Errorf("track '%s' failed after %d attempts: %w", t.Title, maxRetries, lastErr):
-					cancel() // Stop other downloads
+				case errChan <- fmt.Errorf("track '%s' failed: %w", t.Title, lastErr):
+					cancel()
 				default:
 				}
 			} else {
@@ -1021,7 +988,7 @@ func downloadTracks(bookDir string, tracks []Audio, sourceType string) error {
 
 	if err := <-errChan; err != nil {
 		if !verboseMode {
-			fmt.Println() // Move to next line after progress bar
+			fmt.Println()
 		}
 		return err
 	}
@@ -1031,70 +998,83 @@ func downloadTracks(bookDir string, tracks []Audio, sourceType string) error {
 	}
 	return nil
 }
-
-func downloadFileVerbose(downloadUrl, finalFilePath string) error {
+func downloadFileResumable(downloadUrl, finalFilePath string) error {
 	partFilePath := finalFilePath + ".part"
+
+	var startByte int64 = 0
+	if info, err := os.Stat(partFilePath); err == nil {
+		startByte = info.Size()
+	}
 
 	req, err := http.NewRequest("GET", downloadUrl, nil)
 	if err != nil {
-		return fmt.Errorf("request build error: %w", err)
+		return fmt.Errorf("req build error: %w", err)
 	}
 
 	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Referer", "https://knigavuhe.org/")
 
-	// FIX: Disable Keep-Alive.
-	// This forces a new TCP connection for every file.
-	// Helps prevent "Unexpected EOF" caused by the server closing idle connections.
-	req.Close = true
+	if startByte > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", startByte))
+		if verboseMode {
+			debugLog("🔄 Resuming download from byte %d", startByte)
+		}
+	}
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		if urlErr, ok := err.(*url.Error); ok {
-			if urlErr.Timeout() {
-				return fmt.Errorf("connection timed out: %w", err)
-			}
-			if opErr, ok := urlErr.Err.(*net.OpError); ok {
-				return fmt.Errorf("net op error (%s): %w", opErr.Net, err)
-			}
+
+		if strings.Contains(err.Error(), "unexpected EOF") {
+			return fmt.Errorf("connection cut by server (EOF): %w", err)
 		}
 		return fmt.Errorf("network failure: %w", err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("server returned HTTP %d (%s)", resp.StatusCode, http.StatusText(resp.StatusCode))
+	flags := os.O_CREATE | os.O_WRONLY
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		// Server ignores Range or it's a fresh download. Overwrite file.
+		if startByte > 0 && verboseMode {
+			debugLog("⚠️ Server ignored Range header. Restarting from 0.")
+		}
+		flags |= os.O_TRUNC
+		startByte = 0
+	case http.StatusPartialContent:
+
+		flags |= os.O_APPEND
+	case http.StatusRequestedRangeNotSatisfiable:
+
+		return fmt.Errorf("invalid range (file might be done or changed on server)")
+	default:
+		return fmt.Errorf("server HTTP %d (%s)", resp.StatusCode, http.StatusText(resp.StatusCode))
 	}
 
-	if resp.ContentLength == 0 {
-		return fmt.Errorf("server sent empty body (Content-Length: 0)")
-	}
-
-	file, err := os.Create(partFilePath)
+	file, err := os.OpenFile(partFilePath, flags, 0644)
 	if err != nil {
-		return fmt.Errorf("filesystem error (create): %w", err)
+		return fmt.Errorf("file open error: %w", err)
 	}
+	// Important: We don't defer Close() here because we want to check Close() error specifically
 
 	n, err := io.Copy(file, resp.Body)
 	file.Close()
 
 	if err != nil {
-		os.Remove(partFilePath)
+		// If it's EOF, we just return error.
+
 		if err == io.ErrUnexpectedEOF {
-			return fmt.Errorf("connection dropped during download (EOF): %w", err)
+			return fmt.Errorf("stream cut mid-download (saved %d bytes): %w", n, err)
 		}
 		return fmt.Errorf("write error: %w", err)
 	}
 
-	if resp.ContentLength > 0 && n != resp.ContentLength {
-		os.Remove(partFilePath)
-		return fmt.Errorf("incomplete download: expected %d bytes, got %d", resp.ContentLength, n)
+	if resp.StatusCode == http.StatusOK && resp.ContentLength > 0 {
+		if n != resp.ContentLength {
+			return fmt.Errorf("incomplete (200 OK): got %d / %d", n, resp.ContentLength)
+		}
 	}
-
-	if n == 0 {
-		os.Remove(partFilePath)
-		return fmt.Errorf("downloaded 0 bytes")
-	}
+	// If it was partial (206), we can't easily validate total size unless we parse Content-Range,
 
 	if err := os.Rename(partFilePath, finalFilePath); err != nil {
 		return fmt.Errorf("rename failed: %w", err)

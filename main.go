@@ -1,4 +1,5 @@
 package main
+
 import (
 	"bufio"
 	"bytes"
@@ -21,8 +22,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+
 	"github.com/minio/selfupdate"
 )
+
 var (
 	version, gitCommit, buildDate, goVersion, updateURL string
 )
@@ -31,6 +34,7 @@ var (
 	bookConcurrency  int
 	trackConcurrency int
 )
+
 type Person struct {
 	Name string `json:"name"`
 }
@@ -58,17 +62,20 @@ type BookInfo struct {
 	URL, DisplayName, SeriesIndex string
 }
 type BookStatus string
+
 const (
 	StatusPending     BookStatus = "pending"
 	StatusDownloading BookStatus = "downloading"
 	StatusCompleted   BookStatus = "completed"
 	StatusFailed      BookStatus = "failed"
 )
+
 type DownloadState struct {
 	Books map[string]BookStatus `json:"books"`
 	mu    sync.Mutex            `json:"-"`
 	path  string                `json:"-"`
 }
+
 func (s *DownloadState) UpdateStatus(bookName string, status BookStatus) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -101,12 +108,14 @@ func (s *DownloadState) DeleteIfComplete() {
 		fmt.Println("✅ All downloads completed successfully. State file cleaned up.")
 	}
 }
+
 const (
 	userAgent  = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36 Edg/135.0.0.0"
 	cookie     = "new_design=1"
 	maxRetries = 5
 	retryDelay = 2 * time.Second
 )
+
 var (
 	jsonRegex        = regexp.MustCompile(`BookController\.enter\((.*?)\);`)
 	descRegex        = regexp.MustCompile(`bookDescription\">(.+?)</div>`)
@@ -151,6 +160,7 @@ var (
 		},
 	}
 )
+
 func debugLog(format string, v ...any) {
 	if verboseMode {
 		log.Printf("[DEBUG] "+format, v...)
@@ -288,7 +298,6 @@ func main() {
 			if line == "" {
 				continue
 			}
-			// Check for range prefix [start-end]
 			var minIdx, maxIdx int = -1, -1
 			cleanURL := line
 			if match := rangeRegex.FindStringSubmatch(line); len(match) == 4 {
@@ -321,7 +330,6 @@ func main() {
 		fmt.Printf("🚀 Processing %d total books\n", len(allBooks))
 		results = processDownloads(outputDir, allBooks, state)
 	} else {
-		// Single CLI argument (series or book)
 		if strings.Contains(inputArg, "/serie/") {
 			fmt.Printf("🔍 Extracting books from series: %s\n", inputArg)
 			books, err := extractBooksFromSeries(inputArg, -1, -1)
@@ -334,7 +342,6 @@ func main() {
 			fmt.Printf("✅ Found %d books\n", len(books))
 			results = processDownloads(outputDir, books, state)
 		} else {
-			// Single book URL via CLI
 			b := BookInfo{
 				URL:         inputArg,
 				DisplayName: extractBookNameFromURL(inputArg),
@@ -427,22 +434,17 @@ func readLinesFromFile(filename string) ([]string, error) {
 	return lines, scanner.Err()
 }
 func extractBookNameFromURL(bookURL string) string {
-	// Remove query params
 	if idx := strings.Index(bookURL, "?"); idx != -1 {
 		bookURL = bookURL[:idx]
 	}
-	// Trim trailing slash
 	bookURL = strings.TrimRight(bookURL, "/")
 	parts := strings.Split(bookURL, "/")
 	if len(parts) > 0 {
 		lastPart := parts[len(parts)-1]
-		// If last part is numeric (e.g. /1234/), try the previous part
 		if _, err := strconv.Atoi(lastPart); err == nil && len(parts) > 1 {
 			lastPart = parts[len(parts)-2]
 		}
-		// Remove leading ID- if present (e.g. 1523-book-name)
 		if idx := strings.Index(lastPart, "-"); idx > 0 {
-			// Check if prefix is numeric
 			if _, err := strconv.Atoi(lastPart[:idx]); err == nil {
 				lastPart = lastPart[idx+1:]
 			}
@@ -453,7 +455,6 @@ func extractBookNameFromURL(bookURL string) string {
 			return name
 		}
 	}
-	// Fallback using timestamp to ensure uniqueness
 	return fmt.Sprintf("Book_%d", time.Now().UnixNano())
 }
 func extractBooksFromSeries(seriesURL string, minIdx, maxIdx int) ([]BookInfo, error) {
@@ -474,14 +475,17 @@ func extractBooksFromSeries(seriesURL string, minIdx, maxIdx int) ([]BookInfo, e
 			continue
 		}
 		indexStr := strings.TrimSpace(indexMatch[1])
-		// Apply range filter if set
+		indexStr = strings.TrimRight(indexStr, ".")
 		if minIdx != -1 && maxIdx != -1 {
-			// Try to parse simple integer index
-			idxVal, err := strconv.Atoi(strings.TrimRight(indexStr, "."))
+			val, err := strconv.ParseFloat(indexStr, 64)
+			// If it's a valid number, apply the filter
 			if err == nil {
-				if idxVal < minIdx || idxVal > maxIdx {
+				if val < float64(minIdx) || val > float64(maxIdx) {
 					continue
 				}
+			} else {
+				// If we can't parse the index (rare), but a filter is active,
+				continue
 			}
 		}
 		titleMatch := bookTitleRegex.FindStringSubmatch(content)
@@ -504,25 +508,29 @@ func extractBooksFromSeries(seriesURL string, minIdx, maxIdx int) ([]BookInfo, e
 	})
 	return books, nil
 }
-func compareIndices(a, b string) bool {
-	a = strings.Trim(a, "()")
-	b = strings.Trim(b, "()")
-	partsA := strings.Split(a, ".")
-	partsB := strings.Split(b, ".")
-	for i := 0; i < len(partsA) && i < len(partsB); i++ {
-		numA, errA := strconv.Atoi(partsA[i])
-		numB, errB := strconv.Atoi(partsB[i])
-		if errA == nil && errB == nil {
-			if numA != numB {
-				return numA < numB
-			}
-		} else {
-			if partsA[i] != partsB[i] {
-				return partsA[i] < partsB[i]
-			}
-		}
+func compareIndices(i1, i2 string) bool {
+	// Clean string just in case
+	i1 = strings.TrimRight(i1, ".")
+	i2 = strings.TrimRight(i2, ".")
+
+	v1, err1 := strconv.ParseFloat(i1, 64)
+	v2, err2 := strconv.ParseFloat(i2, 64)
+
+	// If both are numbers, compare mathematically
+	if err1 == nil && err2 == nil {
+		return v1 < v2
 	}
-	return len(partsA) < len(partsB)
+
+	// If one is not a number, put numbers first
+	if err1 == nil {
+		return true
+	}
+	if err2 == nil {
+		return false
+	}
+
+	// Fallback to text comparison
+	return i1 < i2
 }
 func processDownloads(outputDir string, books []BookInfo, state *DownloadState) []DownloadResult {
 	sort.Slice(books, func(i, j int) bool {
@@ -602,19 +610,15 @@ func downloadBook(bookURL, outputDir, initialDisplayName string) DownloadResult 
 		result.addError("fetch book data", err)
 		return result
 	}
-	// Smart Naming Strategy
 	var folderName string
 	realBookName := strings.TrimSpace(bookData.Book.Name)
 	if realBookName == "" {
 		realBookName = initialDisplayName
 	}
-	// Update result with real name for summary
 	result.BookName = realBookName
 	if bookData.SeriesName != "" && bookData.SeriesIndex != "" {
-		// Is Series: "1. BookName"
 		folderName = fmt.Sprintf("%s. %s", bookData.SeriesIndex, realBookName)
 	} else {
-		// Not Series: "Author - BookName"
 		author := getAuthorsString(bookData.Book.Authors)
 		if author != "" {
 			folderName = fmt.Sprintf("%s - %s", author, realBookName)
@@ -623,14 +627,12 @@ func downloadBook(bookURL, outputDir, initialDisplayName string) DownloadResult 
 		}
 	}
 	safeFolderName := sanitizePath(folderName)
-	// Update result path
 	bookDir := filepath.Join(outputDir, safeFolderName)
 	if err := os.MkdirAll(bookDir, 0755); err != nil {
 		result.addError("create directory", err)
 		return result
 	}
 	result.Path = bookDir
-	// Only print if different from initial to reduce noise, or always print for clarity
 	fmt.Printf("📂 Target Folder: %s\n", safeFolderName)
 	downloadAssets(bookDir, bookData, &result)
 	return result
@@ -931,12 +933,14 @@ func normalizeURL(rawURL string) (string, error) {
 	u.Scheme = "https"
 	return u.String(), nil
 }
+
 type DownloadResult struct {
 	URL      string
 	BookName string
 	Path     string
 	Errors   []string
 }
+
 func (r *DownloadResult) addError(context string, err error) {
 	r.Errors = append(r.Errors, fmt.Sprintf("%s: %v", context, err))
 }

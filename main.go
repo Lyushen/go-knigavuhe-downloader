@@ -1,5 +1,4 @@
 package main
-
 import (
 	"bufio"
 	"bytes"
@@ -22,10 +21,8 @@ import (
 	"strings"
 	"sync"
 	"time"
-
 	"github.com/minio/selfupdate"
 )
-
 var (
 	version, gitCommit, buildDate, goVersion, updateURL string
 )
@@ -34,16 +31,15 @@ var (
 	bookConcurrency  int
 	trackConcurrency int
 )
-
 type Person struct {
 	Name string `json:"name"`
 }
 type Book struct {
-	Name    string      `json:"name"`
-	Authors interface{} `json:"authors"`
-	Readers interface{} `json:"readers"`
-	Cover   string      `json:"cover"`
-	URL     string      `json:"url"`
+	Name    string `json:"name"`
+	Authors any    `json:"authors"`
+	Readers any    `json:"readers"`
+	Cover   string `json:"cover"`
+	URL     string `json:"url"`
 }
 type Audio struct {
 	Title string `json:"title"`
@@ -62,20 +58,17 @@ type BookInfo struct {
 	URL, DisplayName, SeriesIndex string
 }
 type BookStatus string
-
 const (
 	StatusPending     BookStatus = "pending"
 	StatusDownloading BookStatus = "downloading"
 	StatusCompleted   BookStatus = "completed"
 	StatusFailed      BookStatus = "failed"
 )
-
 type DownloadState struct {
 	Books map[string]BookStatus `json:"books"`
 	mu    sync.Mutex            `json:"-"`
 	path  string                `json:"-"`
 }
-
 func (s *DownloadState) UpdateStatus(bookName string, status BookStatus) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -108,14 +101,12 @@ func (s *DownloadState) DeleteIfComplete() {
 		fmt.Println("✅ All downloads completed successfully. State file cleaned up.")
 	}
 }
-
 const (
 	userAgent  = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36 Edg/135.0.0.0"
 	cookie     = "new_design=1"
 	maxRetries = 5
 	retryDelay = 2 * time.Second
 )
-
 var (
 	jsonRegex        = regexp.MustCompile(`BookController\.enter\((.*?)\);`)
 	descRegex        = regexp.MustCompile(`bookDescription\">(.+?)</div>`)
@@ -127,6 +118,7 @@ var (
 	seriesBlockRegex = regexp.MustCompile(`(?s)class="book_info_line icon_serie"(.*?)</div>\s*</div>`)
 	seriesNameRegex  = regexp.MustCompile(`(?s)href="/serie/[^"]+">([^<]+)</a>`)
 	seriesIndexRegex = regexp.MustCompile(`(?s)class="book_info_line_serie_index">\s*\(([\d\.]+)\)`)
+	rangeRegex       = regexp.MustCompile(`^\[(\d+)-(\d+)\]\s*(.+)$`)
 	customDialer     = &net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
@@ -159,8 +151,7 @@ var (
 		},
 	}
 )
-
-func debugLog(format string, v ...interface{}) {
+func debugLog(format string, v ...any) {
 	if verboseMode {
 		log.Printf("[DEBUG] "+format, v...)
 	}
@@ -214,7 +205,6 @@ func cleanupOldBinary() {
 		if err == nil {
 			oldExe := exe + ".old"
 			if _, err := os.Stat(oldExe); err == nil {
-				// Attempt to remove the old file. If it fails, we can't do much,
 				_ = os.Remove(oldExe)
 			}
 		}
@@ -256,8 +246,6 @@ func main() {
 				time.Sleep(5 * time.Second)
 			}
 		}
-	} else if waitUpdate {
-		log.Fatal("❌ Cannot wait for update: No update URL injected at build time.")
 	}
 	args := flag.Args()
 	if len(args) < 2 {
@@ -270,6 +258,7 @@ func main() {
 		fmt.Println("    -verbose       : Show detailed output")
 		fmt.Println("  For series: go-knigavuhe [flags] <output-dir> <series-url>")
 		fmt.Println("  For file:   go-knigavuhe [flags] <output-dir> <url-file.txt>")
+		fmt.Println("  Series Range example in file: [1-5] https://knigavuhe.org/serie/...")
 		os.Exit(1)
 	}
 	outputDir := args[0]
@@ -299,19 +288,29 @@ func main() {
 			if line == "" {
 				continue
 			}
-			if strings.Contains(line, "/serie/") {
-				fmt.Printf("🔍 Extracting books from series: %s\n", line)
-				books, err := extractBooksFromSeries(line)
+			// Check for range prefix [start-end]
+			var minIdx, maxIdx int = -1, -1
+			cleanURL := line
+			if match := rangeRegex.FindStringSubmatch(line); len(match) == 4 {
+				minIdx, _ = strconv.Atoi(match[1])
+				maxIdx, _ = strconv.Atoi(match[2])
+				cleanURL = strings.TrimSpace(match[3])
+				fmt.Printf("🎯 Series filter applied: [%d to %d] for %s\n", minIdx, maxIdx, cleanURL)
+			}
+			if strings.Contains(cleanURL, "/serie/") {
+				fmt.Printf("🔍 Extracting books from series: %s\n", cleanURL)
+				books, err := extractBooksFromSeries(cleanURL, minIdx, maxIdx)
 				if err != nil {
-					fmt.Printf("⚠️ Error extracting series %s: %v\n", line, err)
+					fmt.Printf("⚠️ Error extracting series %s: %v\n", cleanURL, err)
 					continue
 				}
 				allBooks = append(allBooks, books...)
-				fmt.Printf("✅ Found %d books\n", len(books))
+				fmt.Printf("✅ Found %d books in series range\n", len(books))
 			} else {
+				displayName := extractBookNameFromURL(cleanURL)
 				allBooks = append(allBooks, BookInfo{
-					URL:         line,
-					DisplayName: extractBookNameFromURL(line),
+					URL:         cleanURL,
+					DisplayName: displayName,
 					SeriesIndex: fmt.Sprintf("%d", len(allBooks)+1),
 				})
 			}
@@ -322,16 +321,27 @@ func main() {
 		fmt.Printf("🚀 Processing %d total books\n", len(allBooks))
 		results = processDownloads(outputDir, allBooks, state)
 	} else {
-		fmt.Printf("🔍 Extracting books from series: %s\n", inputArg)
-		books, err := extractBooksFromSeries(inputArg)
-		if err != nil {
-			log.Fatalf("Error extracting books from series: %v", err)
+		// Single CLI argument (series or book)
+		if strings.Contains(inputArg, "/serie/") {
+			fmt.Printf("🔍 Extracting books from series: %s\n", inputArg)
+			books, err := extractBooksFromSeries(inputArg, -1, -1)
+			if err != nil {
+				log.Fatalf("Error extracting books from series: %v", err)
+			}
+			if len(books) == 0 {
+				log.Fatal("❌ No books found in series.")
+			}
+			fmt.Printf("✅ Found %d books\n", len(books))
+			results = processDownloads(outputDir, books, state)
+		} else {
+			// Single book URL via CLI
+			b := BookInfo{
+				URL:         inputArg,
+				DisplayName: extractBookNameFromURL(inputArg),
+				SeriesIndex: "1",
+			}
+			results = processDownloads(outputDir, []BookInfo{b}, state)
 		}
-		if len(books) == 0 {
-			log.Fatal("❌ No books found in series. Run with DEBUG=1 for more info.")
-		}
-		fmt.Printf("✅ Found %d books\n", len(books))
-		results = processDownloads(outputDir, books, state)
 	}
 	fmt.Println("\n" + strings.Repeat("=", 60))
 	fmt.Println("📊 DOWNLOAD SUMMARY")
@@ -417,32 +427,42 @@ func readLinesFromFile(filename string) ([]string, error) {
 	return lines, scanner.Err()
 }
 func extractBookNameFromURL(bookURL string) string {
+	// Remove query params
+	if idx := strings.Index(bookURL, "?"); idx != -1 {
+		bookURL = bookURL[:idx]
+	}
+	// Trim trailing slash
+	bookURL = strings.TrimRight(bookURL, "/")
 	parts := strings.Split(bookURL, "/")
 	if len(parts) > 0 {
 		lastPart := parts[len(parts)-1]
-		lastPart = strings.TrimSuffix(lastPart, "/")
-		if idx := strings.Index(lastPart, "-"); idx > 0 {
-			lastPart = lastPart[idx+1:]
+		// If last part is numeric (e.g. /1234/), try the previous part
+		if _, err := strconv.Atoi(lastPart); err == nil && len(parts) > 1 {
+			lastPart = parts[len(parts)-2]
 		}
-		return strings.ReplaceAll(lastPart, "-", " ")
+		// Remove leading ID- if present (e.g. 1523-book-name)
+		if idx := strings.Index(lastPart, "-"); idx > 0 {
+			// Check if prefix is numeric
+			if _, err := strconv.Atoi(lastPart[:idx]); err == nil {
+				lastPart = lastPart[idx+1:]
+			}
+		}
+		name := strings.ReplaceAll(lastPart, "-", " ")
+		name = strings.TrimSpace(name)
+		if name != "" {
+			return name
+		}
 	}
-	return "Unknown Book"
+	// Fallback using timestamp to ensure uniqueness
+	return fmt.Sprintf("Book_%d", time.Now().UnixNano())
 }
-func extractBooksFromSeries(seriesURL string) ([]BookInfo, error) {
+func extractBooksFromSeries(seriesURL string, minIdx, maxIdx int) ([]BookInfo, error) {
 	html, err := downloadPage(seriesURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to download series page: %w", err)
 	}
-	if os.Getenv("DEBUG") == "1" {
-		debugFile := "debug_series.html"
-		os.WriteFile(debugFile, []byte(html), 0644)
-		fmt.Printf("Debug: Saved HTML to %s\n", debugFile)
-	}
 	var books []BookInfo
 	matches := bookItemRegex.FindAllStringSubmatch(html, -1)
-	if os.Getenv("DEBUG") == "1" {
-		fmt.Printf("Debug: Found %d raw book items\n", len(matches))
-	}
 	for _, match := range matches {
 		content := match[1]
 		urlMatch := bookURLRegex.FindStringSubmatch(content)
@@ -453,17 +473,30 @@ func extractBooksFromSeries(seriesURL string) ([]BookInfo, error) {
 		if len(indexMatch) < 2 {
 			continue
 		}
-		index := strings.TrimSpace(indexMatch[1])
-		titleMatch := bookTitleRegex.FindStringSubmatch(content)
-		if len(titleMatch) < 2 {
-			continue
+		indexStr := strings.TrimSpace(indexMatch[1])
+		// Apply range filter if set
+		if minIdx != -1 && maxIdx != -1 {
+			// Try to parse simple integer index
+			idxVal, err := strconv.Atoi(strings.TrimRight(indexStr, "."))
+			if err == nil {
+				if idxVal < minIdx || idxVal > maxIdx {
+					continue
+				}
+			}
 		}
-		title := strings.TrimSpace(titleMatch[1])
-		displayName := fmt.Sprintf("%s_%s", index, title)
+		titleMatch := bookTitleRegex.FindStringSubmatch(content)
+		title := ""
+		if len(titleMatch) >= 2 {
+			title = strings.TrimSpace(titleMatch[1])
+		}
+		if title == "" {
+			title = extractBookNameFromURL(urlMatch[1])
+		}
+		displayName := fmt.Sprintf("%s. %s", indexStr, title)
 		books = append(books, BookInfo{
 			URL:         "https://knigavuhe.org/" + urlMatch[1],
 			DisplayName: displayName,
-			SeriesIndex: index,
+			SeriesIndex: indexStr,
 		})
 	}
 	sort.Slice(books, func(i, j int) bool {
@@ -495,13 +528,13 @@ func processDownloads(outputDir string, books []BookInfo, state *DownloadState) 
 	sort.Slice(books, func(i, j int) bool {
 		return compareIndices(books[i].SeriesIndex, books[j].SeriesIndex)
 	})
-	fmt.Println("📚 Sorted processing queue:")
+	fmt.Println("📚 Processing queue:")
 	for _, b := range books {
 		status := state.GetStatus(b.DisplayName)
 		if status == "" {
 			status = "Ready"
 		}
-		fmt.Printf("   [%s] %s (Index: %s)\n", status, b.DisplayName, b.SeriesIndex)
+		fmt.Printf("   [%s] %s\n", status, b.DisplayName)
 	}
 	fmt.Println(strings.Repeat("-", 40))
 	var results []DownloadResult
@@ -532,8 +565,33 @@ func processDownloads(outputDir string, books []BookInfo, state *DownloadState) 
 	}
 	return results
 }
-func downloadBook(bookURL, outputDir, displayName string) DownloadResult {
-	result := DownloadResult{URL: bookURL}
+func getAuthorsString(authorsData any) string {
+	var names []string
+	switch v := authorsData.(type) {
+	case map[string]any:
+		for _, item := range v {
+			if person, ok := item.(map[string]any); ok {
+				if name, ok := person["name"].(string); ok {
+					names = append(names, name)
+				}
+			}
+		}
+	case []any:
+		for _, item := range v {
+			if person, ok := item.(map[string]any); ok {
+				if name, ok := person["name"].(string); ok {
+					names = append(names, name)
+				}
+			}
+		}
+	}
+	if len(names) > 0 {
+		return strings.Join(names, ", ")
+	}
+	return ""
+}
+func downloadBook(bookURL, outputDir, initialDisplayName string) DownloadResult {
+	result := DownloadResult{URL: bookURL, BookName: initialDisplayName}
 	normalizedURL, err := normalizeURL(bookURL)
 	if err != nil {
 		result.addError("URL normalization", err)
@@ -544,23 +602,35 @@ func downloadBook(bookURL, outputDir, displayName string) DownloadResult {
 		result.addError("fetch book data", err)
 		return result
 	}
-	folderName := displayName
+	// Smart Naming Strategy
+	var folderName string
+	realBookName := strings.TrimSpace(bookData.Book.Name)
+	if realBookName == "" {
+		realBookName = initialDisplayName
+	}
+	// Update result with real name for summary
+	result.BookName = realBookName
 	if bookData.SeriesName != "" && bookData.SeriesIndex != "" {
-		folderName = fmt.Sprintf("%s_%s", bookData.SeriesIndex, bookData.SeriesName)
-	} else if bookData.SeriesName != "" {
-		folderName = bookData.SeriesName
+		// Is Series: "1. BookName"
+		folderName = fmt.Sprintf("%s. %s", bookData.SeriesIndex, realBookName)
 	} else {
-		folderName = bookData.Book.Name
+		// Not Series: "Author - BookName"
+		author := getAuthorsString(bookData.Book.Authors)
+		if author != "" {
+			folderName = fmt.Sprintf("%s - %s", author, realBookName)
+		} else {
+			folderName = realBookName
+		}
 	}
 	safeFolderName := sanitizePath(folderName)
-	displayName = safeFolderName
+	// Update result path
 	bookDir := filepath.Join(outputDir, safeFolderName)
 	if err := os.MkdirAll(bookDir, 0755); err != nil {
 		result.addError("create directory", err)
 		return result
 	}
-	result.BookName = displayName
 	result.Path = bookDir
+	// Only print if different from initial to reduce noise, or always print for clarity
 	fmt.Printf("📂 Target Folder: %s\n", safeFolderName)
 	downloadAssets(bookDir, bookData, &result)
 	return result
@@ -639,12 +709,10 @@ func extractDescription(html string) (string, error) {
 func sanitizePath(path string) string {
 	safe := forbiddenChars.ReplaceAllString(path, "_")
 	whitespace := regexp.MustCompile(`\s+`)
-	safe = whitespace.ReplaceAllString(safe, "_")
-	multiUnderscore := regexp.MustCompile(`_+`)
-	safe = multiUnderscore.ReplaceAllString(safe, "_")
+	safe = whitespace.ReplaceAllString(safe, " ")
 	safe = strings.Trim(safe, " ._")
 	if safe == "" {
-		safe = "audiobook_file"
+		safe = fmt.Sprintf("Book_Unknown_%d", time.Now().Unix())
 	}
 	return safe
 }
@@ -675,27 +743,8 @@ func downloadWithFallback(urls []string, filePath string) error {
 	return errors.New("all download attempts failed")
 }
 func saveDescription(bookDir string, bookData *BookData) error {
-	getNames := func(data interface{}) string {
-		var names []string
-		switch v := data.(type) {
-		case map[string]interface{}:
-			for _, item := range v {
-				if person, ok := item.(map[string]interface{}); ok {
-					if name, ok := person["name"].(string); ok {
-						names = append(names, name)
-					}
-				}
-			}
-		case []interface{}:
-			for _, item := range v {
-				if person, ok := item.(map[string]interface{}); ok {
-					if name, ok := person["name"].(string); ok {
-						names = append(names, name)
-					}
-				}
-			}
-		}
-		return strings.Join(names, ", ")
+	getNames := func(data any) string {
+		return getAuthorsString(data)
 	}
 	desc := fmt.Sprintf(
 		"Название: %s\nАвтор(ы): %s\nЧтец(ы): %s\n\nОписание:\n%s\n\nURL: %s",
@@ -728,7 +777,6 @@ func downloadTracks(bookDir string, tracks []Audio, sourceType string) error {
 		return fmt.Errorf("track list is empty")
 	}
 	sortTracksNaturally(tracks)
-	// If using sequential mode (or if forced by the user logic), we don't use goroutines.
 	totalTracks := len(tracks)
 	var completedTracks int = 0
 	if !verboseMode {
@@ -742,8 +790,6 @@ func downloadTracks(bookDir string, tracks []Audio, sourceType string) error {
 		}
 		ext = strings.ToLower(ext)
 		safeTitle := sanitizePath(track.Title)
-		// But usually it's safer to rely on the sorted list index.
-		// For now, let's stick to your original title logic:
 		filePath := filepath.Join(bookDir, safeTitle+ext)
 		partFile := filePath + ".part"
 		if !verboseMode {
@@ -777,7 +823,7 @@ func downloadTracks(bookDir string, tracks []Audio, sourceType string) error {
 		if !success {
 			os.Remove(partFile)
 			if !verboseMode {
-				fmt.Println() // Newline so error isn't overwritten
+				fmt.Println()
 			}
 			return fmt.Errorf("track '%s' failed: %w", track.Title, lastErr)
 		}
@@ -818,7 +864,6 @@ func downloadFileResumable(downloadUrl, finalFilePath string) error {
 	flags := os.O_CREATE | os.O_WRONLY
 	switch resp.StatusCode {
 	case http.StatusOK:
-		// Server ignores Range or it's a fresh download. Overwrite file.
 		if startByte > 0 && verboseMode {
 			debugLog("⚠️ Server ignored Range header. Restarting from 0.")
 		}
@@ -835,11 +880,9 @@ func downloadFileResumable(downloadUrl, finalFilePath string) error {
 	if err != nil {
 		return fmt.Errorf("file open error: %w", err)
 	}
-	// Important: We don't defer Close() here because we want to check Close() error specifically
 	n, err := io.Copy(file, resp.Body)
 	file.Close()
 	if err != nil {
-		// If it's EOF, we just return error.
 		if err == io.ErrUnexpectedEOF {
 			return fmt.Errorf("stream cut mid-download (saved %d bytes): %w", n, err)
 		}
@@ -850,7 +893,6 @@ func downloadFileResumable(downloadUrl, finalFilePath string) error {
 			return fmt.Errorf("incomplete (200 OK): got %d / %d", n, resp.ContentLength)
 		}
 	}
-	// If it was partial (206), we can't easily validate total size unless we parse Content-Range,
 	if err := os.Rename(partFilePath, finalFilePath); err != nil {
 		return fmt.Errorf("rename failed: %w", err)
 	}
@@ -889,14 +931,12 @@ func normalizeURL(rawURL string) (string, error) {
 	u.Scheme = "https"
 	return u.String(), nil
 }
-
 type DownloadResult struct {
 	URL      string
 	BookName string
 	Path     string
 	Errors   []string
 }
-
 func (r *DownloadResult) addError(context string, err error) {
 	r.Errors = append(r.Errors, fmt.Sprintf("%s: %v", context, err))
 }
@@ -909,11 +949,8 @@ func compareNatural(a, b string) bool {
 	tokensA := tokenize(a)
 	tokensB := tokenize(b)
 	lenA, lenB := len(tokensA), len(tokensB)
-	limit := lenA
-	if lenB < limit {
-		limit = lenB
-	}
-	for k := 0; k < limit; k++ {
+	limit := min(lenB, lenA)
+	for k := range limit {
 		valA, errA := strconv.Atoi(tokensA[k])
 		valB, errB := strconv.Atoi(tokensB[k])
 		if errA == nil && errB == nil {
